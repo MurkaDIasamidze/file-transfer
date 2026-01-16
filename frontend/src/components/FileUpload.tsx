@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { FileUploadService, UploadProgress } from '../services/uploadService';
+import { FileUploadService, type UploadProgress } from '../services/uploadService';
 
 export const FileUpload: React.FC = () => {
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
@@ -32,8 +32,8 @@ export const FileUpload: React.FC = () => {
     try {
       await uploadService.uploadFile(selectedFile);
       setSuccess(true);
-    } catch (err: any) {
-      setError(err.message || 'Upload failed');
+    } catch (err: unknown) {
+      setError((err as Error).message || 'Upload failed');
       console.error('Upload error:', err);
     } finally {
       setIsUploading(false);

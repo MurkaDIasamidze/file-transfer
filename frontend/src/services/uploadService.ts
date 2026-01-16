@@ -145,7 +145,7 @@ export class FileUploadService {
           status: 'completed',
         });
       }
-    } catch (error: any) {
+    } catch (error: unknown) {
       if (this.onProgress) {
         this.onProgress({
           uploadedChunks: 0,
