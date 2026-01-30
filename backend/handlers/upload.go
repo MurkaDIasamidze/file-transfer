@@ -1,16 +1,39 @@
 package handlers
 
 import (
+	"file-transfer-backend/config"
 	"file-transfer-backend/database"
 	"file-transfer-backend/models"
-	"file-transfer-backend/utils"
-	"fmt"
-	"os"
+	"file-transfer-backend/repository"
+	"file-transfer-backend/services"
+	"file-transfer-backend/types"
 	"path/filepath"
 	"strconv"
+	"sync"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/websocket/v2"
 )
+
+type UploadHandler struct {
+	repo            types.IFileRepository
+	checksumService types.IChecksumService
+	fileService     types.IFileService
+	config          *config.UploadConfig
+	wsClients       map[uint]map[*websocket.Conn]bool
+	wsMutex         sync.RWMutex
+}
+
+func NewUploadHandler(db database.IDatabase, cfg *config.UploadConfig) types.IUploadHandler {
+	checksumService := services.NewChecksumService()
+	return &UploadHandler{
+		repo:            repository.NewFileRepository(db.GetDB()),
+		checksumService: checksumService,
+		fileService:     services.NewFileService(checksumService),
+		config:          cfg,
+		wsClients:       make(map[uint]map[*websocket.Conn]bool),
+	}
+}
 
 type InitUploadRequest struct {
 	FileName    string `json:"file_name"`
@@ -20,24 +43,27 @@ type InitUploadRequest struct {
 	Checksum    string `json:"checksum"`
 }
 
-type UploadChunkRequest struct {
-	FileUploadID uint   `json:"file_upload_id"`
-	ChunkIndex   int    `json:"chunk_index"`
-	Checksum     string `json:"checksum"`
-	Data         []byte `json:"data"`
-}
-
 type CompleteUploadRequest struct {
 	FileUploadID uint `json:"file_upload_id"`
 }
 
-func InitUpload(c *fiber.Ctx) error {
+type UploadStatusResponse struct {
+	ID              uint     `json:"id"`
+	FileName        string   `json:"file_name"`
+	Status          string   `json:"status"`
+	UploadedChunks  []int    `json:"uploaded_chunks"`
+	TotalChunks     int      `json:"total_chunks"`
+	UploadedCount   int      `json:"uploaded_count"`
+	ProgressPercent float64  `json:"progress_percent"`
+}
+
+func (h *UploadHandler) InitUpload(c *fiber.Ctx) error {
 	var req InitUploadRequest
 	if err := c.BodyParser(&req); err != nil {
-		return c.Status(400).JSON(fiber.Map{"error": "Invalid request"})
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid request"})
 	}
 
-	fileUpload := models.FileUpload{
+	fileUpload := &models.FileUpload{
 		FileName:    req.FileName,
 		FileType:    req.FileType,
 		FileSize:    req.FileSize,
@@ -46,8 +72,8 @@ func InitUpload(c *fiber.Ctx) error {
 		Status:      "pending",
 	}
 
-	if err := database.DB.Create(&fileUpload).Error; err != nil {
-		return c.Status(500).JSON(fiber.Map{"error": "Failed to initialize upload"})
+	if err := h.repo.CreateFileUpload(fileUpload); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to initialize upload"})
 	}
 
 	return c.JSON(fiber.Map{
@@ -56,56 +82,48 @@ func InitUpload(c *fiber.Ctx) error {
 	})
 }
 
-func UploadChunk(c *fiber.Ctx) error {
+func (h *UploadHandler) UploadChunk(c *fiber.Ctx) error {
 	fileUploadID, err := strconv.ParseUint(c.FormValue("file_upload_id"), 10, 32)
 	if err != nil {
-		return c.Status(400).JSON(fiber.Map{"error": "Invalid file upload ID"})
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid file upload ID"})
 	}
 
 	chunkIndex, err := strconv.Atoi(c.FormValue("chunk_index"))
 	if err != nil {
-		return c.Status(400).JSON(fiber.Map{"error": "Invalid chunk index"})
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid chunk index"})
 	}
 
 	checksum := c.FormValue("checksum")
-	
+
 	file, err := c.FormFile("chunk")
 	if err != nil {
-		return c.Status(400).JSON(fiber.Map{"error": "No chunk data provided"})
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "No chunk data provided"})
 	}
 
-	// Read chunk data
 	fileData, err := file.Open()
 	if err != nil {
-		return c.Status(500).JSON(fiber.Map{"error": "Failed to read chunk"})
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to read chunk"})
 	}
 	defer fileData.Close()
 
 	data := make([]byte, file.Size)
-	_, err = fileData.Read(data)
-	if err != nil {
-		return c.Status(500).JSON(fiber.Map{"error": "Failed to read chunk data"})
+	if _, err = fileData.Read(data); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to read chunk data"})
 	}
 
-	// Verify checksum
-	if !utils.VerifyChecksum(data, checksum) {
-		return c.Status(400).JSON(fiber.Map{"error": "Checksum verification failed"})
+	if !h.checksumService.Verify(data, checksum) {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Checksum verification failed"})
 	}
 
-	// Check if chunk already exists
-	var existingChunk models.FileChunk
-	result := database.DB.Where("file_upload_id = ? AND chunk_index = ?", fileUploadID, chunkIndex).First(&existingChunk)
-	
-	if result.Error == nil {
-		// Update existing chunk
+	existingChunk, err := h.repo.GetChunk(uint(fileUploadID), chunkIndex)
+	if err == nil {
 		existingChunk.Data = data
 		existingChunk.Checksum = checksum
 		existingChunk.ChunkSize = len(data)
 		existingChunk.Status = "verified"
-		database.DB.Save(&existingChunk)
+		h.repo.UpdateChunk(existingChunk)
 	} else {
-		// Create new chunk
-		chunk := models.FileChunk{
+		chunk := &models.FileChunk{
 			FileUploadID: uint(fileUploadID),
 			ChunkIndex:   chunkIndex,
 			ChunkSize:    len(data),
@@ -114,13 +132,18 @@ func UploadChunk(c *fiber.Ctx) error {
 			Data:         data,
 		}
 
-		if err := database.DB.Create(&chunk).Error; err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": "Failed to save chunk"})
+		if err := h.repo.CreateChunk(chunk); err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to save chunk"})
 		}
 	}
 
-	// Update file upload status
-	database.DB.Model(&models.FileUpload{}).Where("id = ?", fileUploadID).Update("status", "uploading")
+	fileUpload, _ := h.repo.GetFileUpload(uint(fileUploadID))
+	if fileUpload != nil {
+		fileUpload.Status = "uploading"
+		h.repo.UpdateFileUpload(fileUpload)
+	}
+
+	h.broadcastProgress(uint(fileUploadID))
 
 	return c.JSON(fiber.Map{
 		"message":     "Chunk uploaded successfully",
@@ -128,67 +151,48 @@ func UploadChunk(c *fiber.Ctx) error {
 	})
 }
 
-func CompleteUpload(c *fiber.Ctx) error {
+func (h *UploadHandler) CompleteUpload(c *fiber.Ctx) error {
 	var req CompleteUploadRequest
 	if err := c.BodyParser(&req); err != nil {
-		return c.Status(400).JSON(fiber.Map{"error": "Invalid request"})
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid request"})
 	}
 
-	var fileUpload models.FileUpload
-	if err := database.DB.Preload("Chunks").First(&fileUpload, req.FileUploadID).Error; err != nil {
-		return c.Status(404).JSON(fiber.Map{"error": "File upload not found"})
+	fileUpload, err := h.repo.GetFileUpload(req.FileUploadID)
+	if err != nil {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "File upload not found"})
 	}
 
-	// Verify all chunks are uploaded
-	if len(fileUpload.Chunks) != fileUpload.TotalChunks {
-		return c.Status(400).JSON(fiber.Map{
+	chunks, err := h.repo.GetChunksByFileID(req.FileUploadID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to fetch chunks"})
+	}
+
+	if len(chunks) != fileUpload.TotalChunks {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"error":           "Not all chunks uploaded",
-			"uploaded_chunks": len(fileUpload.Chunks),
+			"uploaded_chunks": len(chunks),
 			"total_chunks":    fileUpload.TotalChunks,
 		})
 	}
 
-	// Reconstruct file
-	uploadDir := os.Getenv("UPLOAD_DIR")
-	if uploadDir == "" {
-		uploadDir = "./uploads"
+	filePath := filepath.Join(h.config.Directory, fileUpload.FileName)
+
+	if err := h.fileService.ReconstructFile(fileUpload, chunks, filePath); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
 	}
 
-	filePath := filepath.Join(uploadDir, fileUpload.FileName)
-	outputFile, err := os.Create(filePath)
-	if err != nil {
-		return c.Status(500).JSON(fiber.Map{"error": "Failed to create output file"})
-	}
-	defer outputFile.Close()
-
-	// Write chunks in order
-	for i := 0; i < fileUpload.TotalChunks; i++ {
-		var chunk models.FileChunk
-		if err := database.DB.Where("file_upload_id = ? AND chunk_index = ?", fileUpload.ID, i).First(&chunk).Error; err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": fmt.Sprintf("Chunk %d not found", i)})
-		}
-
-		if _, err := outputFile.Write(chunk.Data); err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": "Failed to write chunk to file"})
-		}
+	verified, err := h.fileService.VerifyCompleteFile(filePath, fileUpload.Checksum)
+	if err != nil || !verified {
+		fileUpload.Status = "failed"
+		h.repo.UpdateFileUpload(fileUpload)
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Final checksum verification failed"})
 	}
 
-	// Read complete file and verify checksum
-	completeData, err := os.ReadFile(filePath)
-	if err != nil {
-		return c.Status(500).JSON(fiber.Map{"error": "Failed to read complete file"})
-	}
-
-	if !utils.VerifyChecksum(completeData, fileUpload.Checksum) {
-		os.Remove(filePath)
-		database.DB.Model(&fileUpload).Update("status", "failed")
-		return c.Status(400).JSON(fiber.Map{"error": "Final checksum verification failed"})
-	}
-
-	// Update file upload status
 	fileUpload.Status = "completed"
 	fileUpload.FilePath = filePath
-	database.DB.Save(&fileUpload)
+	h.repo.UpdateFileUpload(fileUpload)
+
+	h.broadcastProgress(req.FileUploadID)
 
 	return c.JSON(fiber.Map{
 		"message":   "File upload completed successfully",
@@ -197,23 +201,112 @@ func CompleteUpload(c *fiber.Ctx) error {
 	})
 }
 
-func VerifyChunk(c *fiber.Ctx) error {
-	fileUploadID := c.Params("id")
-
-	var chunks []models.FileChunk
-	if err := database.DB.Where("file_upload_id = ?", fileUploadID).Find(&chunks).Error; err != nil {
-		return c.Status(500).JSON(fiber.Map{"error": "Failed to fetch chunks"})
+func (h *UploadHandler) VerifyChunk(c *fiber.Ctx) error {
+	fileUploadID, err := strconv.ParseUint(c.Params("id"), 10, 32)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid file upload ID"})
 	}
 
-	uploadedChunks := make([]int, 0)
-	for _, chunk := range chunks {
-		if chunk.Status == "verified" {
-			uploadedChunks = append(uploadedChunks, chunk.ChunkIndex)
-		}
+	indices, err := h.repo.GetUploadedChunkIndices(uint(fileUploadID))
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to fetch chunks"})
 	}
 
 	return c.JSON(fiber.Map{
-		"uploaded_chunks": uploadedChunks,
-		"total_uploaded":  len(uploadedChunks),
+		"uploaded_chunks": indices,
+		"total_uploaded":  len(indices),
 	})
+}
+
+func (h *UploadHandler) GetUploadStatus(c *fiber.Ctx) error {
+	fileUploadID, err := strconv.ParseUint(c.Params("id"), 10, 32)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid file upload ID"})
+	}
+
+	fileUpload, err := h.repo.GetFileUpload(uint(fileUploadID))
+	if err != nil {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "File upload not found"})
+	}
+
+	indices, _ := h.repo.GetUploadedChunkIndices(uint(fileUploadID))
+	
+	progress := float64(0)
+	if fileUpload.TotalChunks > 0 {
+		progress = (float64(len(indices)) / float64(fileUpload.TotalChunks)) * 100
+	}
+
+	return c.JSON(UploadStatusResponse{
+		ID:              fileUpload.ID,
+		FileName:        fileUpload.FileName,
+		Status:          fileUpload.Status,
+		UploadedChunks:  indices,
+		TotalChunks:     fileUpload.TotalChunks,
+		UploadedCount:   len(indices),
+		ProgressPercent: progress,
+	})
+}
+
+func (h *UploadHandler) HandleWebSocket(c *websocket.Conn) {
+	fileUploadIDStr := c.Params("id")
+	fileUploadID, err := strconv.ParseUint(fileUploadIDStr, 10, 32)
+	if err != nil {
+		c.Close()
+		return
+	}
+
+	h.wsMutex.Lock()
+	if h.wsClients[uint(fileUploadID)] == nil {
+		h.wsClients[uint(fileUploadID)] = make(map[*websocket.Conn]bool)
+	}
+	h.wsClients[uint(fileUploadID)][c] = true
+	h.wsMutex.Unlock()
+
+	defer func() {
+		h.wsMutex.Lock()
+		delete(h.wsClients[uint(fileUploadID)], c)
+		h.wsMutex.Unlock()
+		c.Close()
+	}()
+
+	for {
+		if _, _, err := c.ReadMessage(); err != nil {
+			break
+		}
+	}
+}
+
+func (h *UploadHandler) broadcastProgress(fileUploadID uint) {
+	h.wsMutex.RLock()
+	clients := h.wsClients[fileUploadID]
+	h.wsMutex.RUnlock()
+
+	if clients == nil {
+		return
+	}
+
+	indices, _ := h.repo.GetUploadedChunkIndices(fileUploadID)
+	fileUpload, _ := h.repo.GetFileUpload(fileUploadID)
+
+	progress := float64(0)
+	if fileUpload != nil && fileUpload.TotalChunks > 0 {
+		progress = (float64(len(indices)) / float64(fileUpload.TotalChunks)) * 100
+	}
+
+	message := fiber.Map{
+		"type":             "progress",
+		"uploaded_chunks":  len(indices),
+		"total_chunks":     fileUpload.TotalChunks,
+		"progress_percent": progress,
+		"status":           fileUpload.Status,
+	}
+
+	for client := range clients {
+		if err := client.WriteJSON(message); err != nil {
+			client.Close()
+			h.wsMutex.Lock()
+			delete(h.wsClients[fileUploadID], client)
+			h.wsMutex.Unlock()
+		}
+	}
 }
