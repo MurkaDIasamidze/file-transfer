@@ -50,7 +50,7 @@ go get github.com/joho/godotenv
 DB_HOST=localhost
 DB_USER=postgres
 DB_PASSWORD=yourpassword
-DB_NAME=postgres
+DB_NAME=filetransfer
 DB_PORT=5432
 SERVER_PORT=8080
 UPLOAD_DIR=./uploads
@@ -58,7 +58,7 @@ UPLOAD_DIR=./uploads
 
 3. Create PostgreSQL database:
 ```sql
-CREATE DATABASE postgres;
+CREATE DATABASE filetransfer;
 ```
 
 4. Run the backend:
@@ -70,10 +70,12 @@ go run main.go
 
 1. Create React + TypeScript project:
 ```bash
-npm create vite@latest
+npm create vite@latest frontend
 cd frontend
 npm install
 npm install axios
+npm install -D tailwindcss@3 postcss autoprefixer
+npx tailwindcss init -p
 ```
 
 2. Create `.env` file in frontend/:
