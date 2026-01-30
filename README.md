@@ -6,29 +6,40 @@
 file-transfer-system/
 ├── backend/
 │   ├── main.go
+│   ├── config/
+│   │   └── config.go
+│   ├── types/
+│   │   └── interfaces.go
 │   ├── models/
 │   │   └── file.go
 │   ├── handlers/
 │   │   └── upload.go
+│   ├── repository/
+│   │   └── file_repository.go
+│   ├── services/
+│   │   └── file_service.go
 │   ├── database/
 │   │   └── db.go
-│   ├── utils/
-│   │   └── checksum.go
 │   ├── uploads/
 │   ├── go.mod
-│   └── .env
+│   ├── .env
+│   └── .env.example
 └── frontend/
     ├── src/
     │   ├── App.tsx
+    │   ├── main.tsx
+    │   ├── index.css
     │   ├── components/
     │   │   └── FileUpload.tsx
-    │   ├── services/
-    │   │   └── uploadService.ts
-    │   └── main.tsx
+    │   └── services/
+    │       └── uploadService.ts
     ├── package.json
     ├── tsconfig.json
     ├── vite.config.ts
-    └── .env
+    ├── tailwind.config.js
+    ├── postcss.config.js
+    ├── .env
+    └── .env.example
 ```
 
 ## Setup Instructions
@@ -52,7 +63,7 @@ DB_USER=postgres
 DB_PASSWORD=yourpassword
 DB_NAME=filetransfer
 DB_PORT=5432
-SERVER_PORT=8080
+SERVER_PORT=8081
 UPLOAD_DIR=./uploads
 ```
 
@@ -70,7 +81,7 @@ go run main.go
 
 1. Create React + TypeScript project:
 ```bash
-npm create vite@latest frontend
+npm create vite@latest 
 cd frontend
 npm install
 npm install axios
@@ -90,10 +101,16 @@ npm run dev
 
 ## Features
 
-- ✅ Chunked file upload (1MB chunks)
+- ✅ Chunked file upload (configurable chunk size via .env)
 - ✅ SHA256 checksum verification
-- ✅ Progress tracking
+- ✅ **WebSocket real-time progress updates**
+- ✅ **Interface-based architecture (IDatabase, IUploadHandler, IFileRepository, etc.)**
+- ✅ **Configuration via structs loaded from .env**
+- ✅ **No hardcoded values - all configurable**
+- ✅ Progress tracking with live updates
 - ✅ Error detection and retry logic
 - ✅ PostgreSQL storage of file metadata
 - ✅ Complete file reconstruction on server
 - ✅ Original filename and type preservation
+- ✅ Repository pattern for database operations
+- ✅ Service layer for business logic
