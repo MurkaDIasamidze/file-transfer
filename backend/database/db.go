@@ -4,7 +4,7 @@ import (
 	"file-transfer-backend/config"
 	"file-transfer-backend/models"
 	"fmt"
-	"log"
+	"log/slog"
 
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
@@ -17,51 +17,48 @@ type IDatabase interface {
 }
 
 type Database struct {
-	config *config.DatabaseConfig
-	db     *gorm.DB
+	cfg *config.DatabaseConfig
+	db  *gorm.DB
 }
 
-func NewDatabase(cfg *config.DatabaseConfig) IDatabase {
-	return &Database{
-		config: cfg,
-	}
+func New(cfg *config.DatabaseConfig) IDatabase {
+	return &Database{cfg: cfg}
 }
 
 func (d *Database) Connect() error {
-	dsn := fmt.Sprintf("host=%s user=%s password=%s dbname=%s port=%s sslmode=%s",
-		d.config.Host,
-		d.config.User,
-		d.config.Password,
-		d.config.Name,
-		d.config.Port,
-		d.config.SSLMode,
+	dsn := fmt.Sprintf(
+		"host=%s user=%s password=%s dbname=%s port=%s sslmode=%s",
+		d.cfg.Host, d.cfg.User, d.cfg.Password,
+		d.cfg.Name, d.cfg.Port, d.cfg.SSLMode,
 	)
 
 	var err error
 	d.db, err = gorm.Open(postgres.Open(dsn), &gorm.Config{})
 	if err != nil {
-		return fmt.Errorf("failed to connect to database: %w", err)
+		return fmt.Errorf("open db: %w", err)
 	}
 
-	log.Println("Database connected successfully")
+	slog.Info("database connected", "host", d.cfg.Host, "name", d.cfg.Name)
 
-	// Auto migrate models
-	if err = d.db.AutoMigrate(&models.FileUpload{}, &models.FileChunk{}); err != nil {
-		return fmt.Errorf("failed to migrate database: %w", err)
+	if err = d.db.AutoMigrate(
+		&models.User{},
+		&models.Folder{},
+		&models.FileUpload{},
+		&models.FileChunk{},
+	); err != nil {
+		return fmt.Errorf("auto migrate: %w", err)
 	}
 
-	log.Println("Database migration completed")
+	slog.Info("database migration completed")
 	return nil
 }
 
-func (d *Database) GetDB() *gorm.DB {
-	return d.db
-}
+func (d *Database) GetDB() *gorm.DB { return d.db }
 
 func (d *Database) Close() error {
-	sqlDB, err := d.db.DB()
+	sql, err := d.db.DB()
 	if err != nil {
 		return err
 	}
-	return sqlDB.Close()
+	return sql.Close()
 }

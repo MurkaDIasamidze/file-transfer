@@ -1,202 +1,178 @@
-import axios from 'axios';
-
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8081';
-const WS_URL = import.meta.env.VITE_WS_URL || 'ws://localhost:8081';
-const CHUNK_SIZE = parseInt(import.meta.env.VITE_CHUNK_SIZE || '1048576'); // 1MB default
+import { filesApi } from './api';
 
 export interface UploadProgress {
+  fileUploadId:   number;
+  fileName:       string;
   uploadedChunks: number;
-  totalChunks: number;
-  percentage: number;
-  status: string;
+  totalChunks:    number;
+  percentage:     number;
+  status:         string;
 }
 
-interface IUploadService {
-  uploadFile(file: File): Promise<void>;
-  connectWebSocket(fileUploadId: number): void;
-  disconnectWebSocket(): void;
+const CHUNK_SIZE = parseInt(import.meta.env.VITE_CHUNK_SIZE ?? '1048576');
+const WS_BASE    = import.meta.env.VITE_WS_URL ?? 'ws://localhost:8081';
+const MAX_RETRY  = 3;
+
+async function sha256hex(buf: ArrayBuffer): Promise<string> {
+  const hash = await crypto.subtle.digest('SHA-256', buf);
+  return Array.from(new Uint8Array(hash))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
 }
 
-async function calculateChecksum(data: ArrayBuffer): Promise<string> {
-  const hashBuffer = await crypto.subtle.digest('SHA-256', data);
-  const hashArray = Array.from(new Uint8Array(hashBuffer));
-  return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
-}
+export class UploadService {
+  private ws?:        WebSocket;
+  private reconnects  = 0;
+  private done        = false; // guard — stops reconnect loop after upload completes
 
-export class FileUploadService implements IUploadService {
-  private onProgress?: (progress: UploadProgress) => void;
-  private fileUploadId?: number;
-  private ws?: WebSocket;
-  private reconnectAttempts: number = 0;
-  private maxReconnectAttempts: number = 5;
+  constructor(
+    private onProgress: (p: UploadProgress) => void,
+    private onComplete: () => void,
+    private onError:    (msg: string) => void,
+  ) {}
 
-  constructor(onProgress?: (progress: UploadProgress) => void) {
-    this.onProgress = onProgress;
-  }
-
-  async uploadFile(file: File): Promise<void> {
+  async upload(file: File, folderId?: number | null): Promise<void> {
     const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
-    
-    const fileBuffer = await file.arrayBuffer();
-    const fileChecksum = await calculateChecksum(fileBuffer);
+    const fileBuf     = await file.arrayBuffer();
+    const checksum    = await sha256hex(fileBuf);
 
-    const initResponse = await axios.post(`${API_URL}/api/upload/init`, {
-      file_name: file.name,
-      file_type: file.type,
-      file_size: file.size,
+    const { data } = await filesApi.initUpload({
+      file_name:    file.name,
+      file_type:    file.type,
+      file_size:    file.size,
       total_chunks: totalChunks,
-      checksum: fileChecksum,
+      checksum,
+      folder_id:    folderId ?? null,
     });
 
-    this.fileUploadId = initResponse.data.file_upload_id;
+    const fileId = data.file_upload_id;
+    this.openWS(fileId, file.name, totalChunks);
 
-    // Connect WebSocket with proper ID
-    if (this.fileUploadId) {
-      this.connectWebSocket(this.fileUploadId);
-    }
+    await this.sendChunks(file, fileId, totalChunks);
+    await filesApi.complete(fileId);
 
-    await this.uploadChunks(file, totalChunks);
+    // Mark done BEFORE closing so the onclose handler doesn't reconnect
+    this.done = true;
+    this.ws?.close();
 
-    await this.completeUpload();
+    this.onProgress({
+      fileUploadId:   fileId,
+      fileName:       file.name,
+      uploadedChunks: totalChunks,
+      totalChunks,
+      percentage:     100,
+      status:         'completed',
+    });
+
+    this.onComplete();
   }
 
-  connectWebSocket(fileUploadId: number): void {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+  private async sendChunks(file: File, fileId: number, total: number): Promise<void> {
+    const done    = new Set<number>();
+    let   retries = 0;
+
+    while (done.size < total) {
+      for (let i = 0; i < total; i++) {
+        if (done.has(i)) continue;
+        try {
+          const start = i * CHUNK_SIZE;
+          const slice = file.slice(start, Math.min(start + CHUNK_SIZE, file.size));
+          const buf   = await slice.arrayBuffer();
+          const cs    = await sha256hex(buf);
+
+          const form = new FormData();
+          form.append('file_upload_id', String(fileId));
+          form.append('chunk_index',    String(i));
+          form.append('checksum',       cs);
+          form.append('chunk',          new Blob([buf]));
+
+          await filesApi.uploadChunk(form);
+          done.add(i);
+
+          // Emit progress from client side immediately after each chunk
+          // (don't wait for WS — it may be slightly behind)
+          this.onProgress({
+            fileUploadId:   fileId,
+            fileName:       file.name,
+            uploadedChunks: done.size,
+            totalChunks:    total,
+            percentage:     Math.round((done.size / total) * 100),
+            status:         'uploading',
+          });
+
+          // Server-side verification every 10 chunks
+          if (done.size % 10 === 0) {
+            await this.verifyWithServer(fileId, done);
+          }
+        } catch (err) {
+          console.warn(`chunk ${i} failed`, err);
+        }
+      }
+
+      if (done.size < total) {
+        retries++;
+        if (retries >= MAX_RETRY) {
+          this.onError('Upload failed after max retries');
+          throw new Error('max retries exceeded');
+        }
+        await sleep(1000 * retries);
+      }
+    }
+  }
+
+  private async verifyWithServer(fileId: number, done: Set<number>): Promise<void> {
+    try {
+      const { data } = await filesApi.verify(fileId);
+      const srv = new Set(data.uploaded_chunks);
+      for (const i of [...done]) {
+        if (!srv.has(i)) done.delete(i);
+      }
+    } catch {
+      // non-fatal — retry will catch missing chunks
+    }
+  }
+
+  private openWS(fileId: number, fileName: string, totalChunks: number): void {
+    try {
+      this.ws = new WebSocket(`${WS_BASE}/ws/upload/${fileId}`);
+    } catch {
+      // WS is optional — upload proceeds via HTTP chunks regardless
       return;
     }
 
-    const wsUrl = `${WS_URL}/ws/upload/${fileUploadId}`;
-    this.ws = new WebSocket(wsUrl);
-
-    this.ws.onopen = () => {
-      console.log('WebSocket connected');
-      this.reconnectAttempts = 0;
-    };
-
-    this.ws.onmessage = (event) => {
+    this.ws.onmessage = (ev) => {
       try {
-        const data = JSON.parse(event.data);
-        if (data.type === 'progress' && this.onProgress) {
+        const msg = JSON.parse(ev.data as string);
+        if (msg.type === 'progress') {
           this.onProgress({
-            uploadedChunks: data.uploaded_chunks,
-            totalChunks: data.total_chunks,
-            percentage: Math.round(data.progress_percent),
-            status: data.status,
+            fileUploadId:   msg.file_upload_id,
+            fileName:       msg.file_name ?? fileName,
+            uploadedChunks: msg.uploaded_chunks,
+            totalChunks:    msg.total_chunks ?? totalChunks,
+            percentage:     Math.round(msg.progress_percent),
+            status:         msg.status,
           });
         }
-      } catch (error) {
-        console.error('Error parsing WebSocket message:', error);
+      } catch {
+        // ignore malformed WS messages
       }
     };
 
-    this.ws.onerror = (error) => {
-      console.error('WebSocket error:', error);
+    this.ws.onerror = () => {
+      // WS error is non-fatal — chunks still upload via HTTP
+      console.warn('WebSocket error — progress updates may be delayed');
     };
 
     this.ws.onclose = () => {
-      console.log('WebSocket disconnected');
-      if (this.reconnectAttempts < this.maxReconnectAttempts) {
-        this.reconnectAttempts++;
+      // Only reconnect if upload is still in progress and under retry limit
+      if (!this.done && this.reconnects < 3) {
+        this.reconnects++;
         setTimeout(() => {
-          if (this.fileUploadId) {
-            this.connectWebSocket(this.fileUploadId);
-          }
+          if (!this.done) this.openWS(fileId, fileName, totalChunks);
         }, 2000);
       }
     };
   }
-
-  disconnectWebSocket(): void {
-    if (this.ws) {
-      this.ws.close();
-      this.ws = undefined;
-    }
-  }
-
-  private async uploadChunks(file: File, totalChunks: number): Promise<void> {
-    const uploadedChunks = new Set<number>();
-    let retryCount = 0;
-    const maxRetries = parseInt(import.meta.env.VITE_MAX_RETRIES || '3');
-
-    while (uploadedChunks.size < totalChunks && retryCount < maxRetries) {
-      for (let i = 0; i < totalChunks; i++) {
-        if (uploadedChunks.has(i)) continue;
-
-        try {
-          const start = i * CHUNK_SIZE;
-          const end = Math.min(start + CHUNK_SIZE, file.size);
-          const chunk = file.slice(start, end);
-          const chunkBuffer = await chunk.arrayBuffer();
-          const chunkChecksum = await calculateChecksum(chunkBuffer);
-
-          const formData = new FormData();
-          formData.append('file_upload_id', this.fileUploadId!.toString());
-          formData.append('chunk_index', i.toString());
-          formData.append('checksum', chunkChecksum);
-          formData.append('chunk', new Blob([chunkBuffer]));
-
-          await axios.post(`${API_URL}/api/upload/chunk`, formData, {
-            headers: {
-              'Content-Type': 'multipart/form-data',
-            },
-          });
-
-          uploadedChunks.add(i);
-
-          const verifyInterval = parseInt(import.meta.env.VITE_VERIFY_INTERVAL || '10');
-          if (uploadedChunks.size % verifyInterval === 0) {
-            await this.verifyUploadedChunks(uploadedChunks);
-          }
-
-        } catch (error) {
-          console.error(`Error uploading chunk ${i}:`, error);
-        }
-      }
-
-      if (uploadedChunks.size < totalChunks) {
-        retryCount++;
-        console.log(`Retry attempt ${retryCount} of ${maxRetries}`);
-        await new Promise(resolve => setTimeout(resolve, 1000));
-      }
-    }
-
-    if (uploadedChunks.size < totalChunks) {
-      throw new Error(`Failed to upload all chunks after ${maxRetries} retries`);
-    }
-  }
-
-  private async verifyUploadedChunks(uploadedChunks: Set<number>): Promise<void> {
-    try {
-      const response = await axios.get(
-        `${API_URL}/api/upload/verify/${this.fileUploadId}`
-      );
-
-      const serverChunks = new Set(response.data.uploaded_chunks);
-      
-      for (const chunkIndex of uploadedChunks) {
-        if (!serverChunks.has(chunkIndex)) {
-          console.warn(`Chunk ${chunkIndex} missing on server, will retry`);
-          uploadedChunks.delete(chunkIndex);
-        }
-      }
-    } catch (error) {
-      console.error('Error verifying chunks:', error);
-    }
-  }
-
-  private async completeUpload(): Promise<void> {
-    try {
-      await axios.post(`${API_URL}/api/upload/complete`, {
-        file_upload_id: this.fileUploadId,
-      });
-
-      setTimeout(() => {
-        this.disconnectWebSocket();
-      }, 1000);
-
-    } catch (error: unknown) {
-      this.disconnectWebSocket();
-      throw error;
-    }
-  }
 }
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
