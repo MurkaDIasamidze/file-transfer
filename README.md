@@ -215,7 +215,3 @@ See the individual READMEs for the full list of environment variables:
 Please run `go test ./...` (backend) and `npm run typecheck && npm run lint` (frontend) before submitting.
 
 ---
-
-## License
-
-MIT
