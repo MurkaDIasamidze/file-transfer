@@ -1,7 +1,9 @@
-// uploadService.ts — WebSocket-based upload (files + folders)
+// uploadService.ts — WebSocket-based chunked upload
 
-const WS_BASE   = (import.meta.env.VITE_WS_URL ?? 'ws://localhost:8081').replace(/\/$/, '');
-const CHUNK_SIZE = parseInt(import.meta.env.VITE_CHUNK_SIZE ?? '262144'); // 256 KB default
+const WS_BASE    = (import.meta.env.VITE_WS_URL ?? 'ws://localhost:8081').replace(/\/$/, '');
+const CHUNK_SIZE = parseInt(import.meta.env.VITE_CHUNK_SIZE ?? '262144', 10); // 256 KB
+
+// ─── Public types ─────────────────────────────────────────────────────────────
 
 export interface UploadProgress {
   fileUploadId:   number;
@@ -15,207 +17,245 @@ export interface UploadProgress {
 
 export interface UploadTask {
   file:    File;
-  relPath: string; // '' for single file, 'dir/sub/file.txt' for folder
+  relPath: string; // '' for plain file, 'folder/sub/file.txt' for folder uploads
 }
 
+// ─── FileSystem API helpers (for drag-drop folder support) ────────────────────
+//
+// When a folder is dragged from the OS, DataTransfer.files is flat (top-level
+// only) and webkitRelativePath is NOT set. The only correct way to get the full
+// recursive file tree with relative paths is webkitGetAsEntry() / FileSystem API.
+//
+// CRITICAL: webkitGetAsEntry() MUST be called synchronously inside the drop
+// event handler before it returns — the DataTransfer becomes invalid afterwards.
+// We therefore split the work: collect entries sync, then read files async.
+
+function readAllEntries(reader: FileSystemDirectoryReader): Promise<FileSystemEntry[]> {
+  // readEntries() yields at most 100 items per call — must loop until empty batch.
+  return new Promise((resolve, reject) => {
+    const all: FileSystemEntry[] = [];
+    function next() {
+      reader.readEntries(batch => {
+        if (batch.length === 0) { resolve(all); return; }
+        all.push(...batch);
+        next();
+      }, reject);
+    }
+    next();
+  });
+}
+
+async function entryToTasks(entry: FileSystemEntry, prefix: string): Promise<UploadTask[]> {
+  if (entry.isFile) {
+    const file = await new Promise<File>((resolve, reject) =>
+      (entry as FileSystemFileEntry).file(resolve, reject)
+    );
+    const relPath = prefix ? `${prefix}/${entry.name}` : entry.name;
+    return [{ file, relPath }];
+  }
+
+  if (entry.isDirectory) {
+    const dirPrefix = prefix ? `${prefix}/${entry.name}` : entry.name;
+    const reader    = (entry as FileSystemDirectoryEntry).createReader();
+    const children  = await readAllEntries(reader);
+    const nested    = await Promise.all(children.map(c => entryToTasks(c, dirPrefix)));
+    return nested.flat();
+  }
+
+  return [];
+}
+
+/**
+ * Convert a DataTransfer to UploadTask[].
+ *
+ * Handles:
+ *   - Plain file drops  (one or many files)
+ *   - Folder drops      (recursive, preserving relative paths)
+ *   - Mixed drops       (files + folders in one drop)
+ *
+ * MUST receive the entries array that was collected SYNCHRONOUSLY during the
+ * drop event (see collectEntriesSync below).
+ */
+export async function entriesToTasks(entries: FileSystemEntry[]): Promise<UploadTask[]> {
+  const groups = await Promise.all(entries.map(e => entryToTasks(e, '')));
+  return groups.flat();
+}
+
+/**
+ * Call this SYNCHRONOUSLY inside the drop event handler to snapshot the
+ * FileSystemEntry objects before the DataTransfer becomes invalid.
+ */
+export function collectEntriesSync(dt: DataTransfer): FileSystemEntry[] {
+  const entries: FileSystemEntry[] = [];
+  if (dt.items) {
+    for (let i = 0; i < dt.items.length; i++) {
+      const entry = dt.items[i].webkitGetAsEntry?.();
+      if (entry) entries.push(entry);
+    }
+  }
+  return entries;
+}
+
+/**
+ * Convert a FileList (from <input> elements) to UploadTask[].
+ * webkitRelativePath is set when the user picks via <input webkitdirectory>.
+ */
+export function filesToTasks(files: FileList): UploadTask[] {
+  return Array.from(files).map(f => ({
+    file:    f,
+    relPath: (f as File & { webkitRelativePath?: string }).webkitRelativePath ?? '',
+  }));
+}
+
+// ─── WebSocket upload helpers ─────────────────────────────────────────────────
+
 async function sha256hex(buf: ArrayBuffer): Promise<string> {
-  const hash = await crypto.subtle.digest('SHA-256', buf);
-  return Array.from(new Uint8Array(hash))
+  const digest = await crypto.subtle.digest('SHA-256', buf);
+  return Array.from(new Uint8Array(digest))
     .map(b => b.toString(16).padStart(2, '0'))
     .join('');
 }
 
-// ─── Single connection shared across an upload session ───────────────────────
+function toBase64(buf: ArrayBuffer): string {
+  const bytes = new Uint8Array(buf);
+  let bin = '';
+  for (let i = 0; i < bytes.byteLength; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin);
+}
 
-export class UploadSession {
-  private ws!: WebSocket;
-  private ready  = false;
-  private queue: Array<() => void> = [];
-  private messageHandlers = new Map<number, (msg: Record<string, unknown>) => void>();
+function openWS(token: string): Promise<WebSocket> {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(`${WS_BASE}/ws/upload?token=${token}`);
+    ws.onopen  = () => resolve(ws);
+    ws.onerror = ()  => reject(new Error('WebSocket connection failed'));
+  });
+}
 
-  constructor(
-    private token: string,
-    private onProgress: (p: UploadProgress) => void,
-    private onError: (msg: string) => void,
-  ) {}
+/**
+ * Send one JSON message over ws and wait for the next server message that
+ * matches one of acceptTypes. Rejects immediately on 'error' messages.
+ */
+function sendAndWait(
+  ws: WebSocket,
+  payload: unknown,
+  acceptTypes: string[],
+): Promise<Record<string, unknown>> {
+  return new Promise((resolve, reject) => {
+    const handler = (ev: MessageEvent) => {
+      let msg: Record<string, unknown>;
+      try { msg = JSON.parse(ev.data as string); }
+      catch { return; }
 
-  async open(): Promise<void> {
-    return new Promise((resolve, reject) => {
-      this.ws = new WebSocket(`${WS_BASE}/ws/upload?token=${this.token}`);
-      this.ws.binaryType = 'arraybuffer';
+      const t = msg.type as string;
+      if (t === 'error') {
+        ws.removeEventListener('message', handler);
+        reject(new Error((msg.message as string) || 'server error'));
+        return;
+      }
+      if (acceptTypes.includes(t)) {
+        ws.removeEventListener('message', handler);
+        resolve(msg);
+      }
+    };
 
-      this.ws.onopen = () => {
-        this.ready = true;
-        this.queue.forEach(fn => fn());
-        this.queue = [];
-        resolve();
-      };
+    ws.addEventListener('message', handler);
+    ws.send(JSON.stringify(payload));
+  });
+}
 
-      this.ws.onerror = () => reject(new Error('WebSocket connection failed'));
+// ─── Single-file upload over a dedicated WebSocket ───────────────────────────
+//
+// One WS per file keeps the protocol trivially simple: strict request/response,
+// no multiplexing, no ID routing, no shared state between files.
 
-      this.ws.onmessage = (ev) => {
-        try {
-          const msg = JSON.parse(ev.data as string) as Record<string, unknown>;
-          const type = msg.type as string;
+async function uploadOneFile(
+  task: UploadTask,
+  folderId: number | null,
+  token: string,
+  onProgress: (p: UploadProgress) => void,
+): Promise<void> {
+  const { file, relPath } = task;
 
-          if (type === 'error') {
-            this.onError(msg.message as string);
-          }
+  const fileBuf     = await file.arrayBuffer();
+  const checksum    = await sha256hex(fileBuf);
+  const totalChunks = Math.ceil(file.size / CHUNK_SIZE) || 1;
 
-          // Extract file_upload_id — it lives at the top level for most messages
-          // (progress, error) but is nested inside `file.id` for `done` messages
-          // because the server sends: { type: "done", file: { id: X, ... } }
-          let fileId = msg.file_upload_id as number | undefined;
-          if (!fileId && type === 'done') {
-            const fileObj = msg.file as Record<string, unknown> | undefined;
-            fileId = fileObj?.id as number | undefined;
-          }
-
-          if (fileId && this.messageHandlers.has(fileId)) {
-            this.messageHandlers.get(fileId)!(msg);
-          } else if (type === 'init_ack') {
-            // init_ack routes via temp key -1 (we don't know the ID until we receive it)
-            this.messageHandlers.get(-1)?.(msg);
-          }
-        } catch { /* ignore malformed */ }
-      };
-
-      this.ws.onclose = () => {
-        this.ready = false;
-      };
-    });
-  }
-
-  close() {
-    this.ws?.close();
-  }
-
-  private send(data: unknown) {
-    const fn = () => this.ws.send(JSON.stringify(data));
-    if (this.ready) fn();
-    else this.queue.push(fn);
-  }
-
-  // ── Upload a single file task ─────────────────────────────────────────────
-
-  async uploadFile(
-    task: UploadTask,
-    folderId: number | null,
-    onFileProgress: (p: UploadProgress) => void,
-  ): Promise<void> {
-    const { file, relPath } = task;
-    const fileBuf     = await file.arrayBuffer();
-    const checksum    = await sha256hex(fileBuf);
-    const totalChunks = Math.ceil(file.size / CHUNK_SIZE) || 1;
-
-    // ── 1. Init ─────────────────────────────────────────────────────────────
-    const fileUploadId: number = await new Promise((resolve, reject) => {
-      // Temporary handler for init_ack — keyed by -1 since we don't have the
-      // file_upload_id yet. Cleared immediately upon receipt.
-      this.messageHandlers.set(-1, (msg) => {
-        if (msg.type === 'init_ack') {
-          this.messageHandlers.delete(-1);
-          resolve(msg.file_upload_id as number);
-        } else if (msg.type === 'error') {
-          this.messageHandlers.delete(-1);
-          reject(new Error(msg.message as string));
-        }
-      });
-
-      this.send({
+  const ws = await openWS(token);
+  try {
+    // 1. Init
+    const initAck = await sendAndWait(
+      ws,
+      {
         type: 'init',
         data: {
-          file_name:  file.name,
-          file_type:  file.type,
-          file_size:  file.size,
+          file_name: file.name,
+          file_type: file.type || 'application/octet-stream',
+          file_size: file.size,
           checksum,
-          folder_id:  folderId,
-          rel_path:   relPath,
+          folder_id: folderId,
+          rel_path:  relPath,
         },
-      });
-    });
+      },
+      ['init_ack'],
+    );
+    const fileUploadId = initAck.file_upload_id as number;
 
-    // ── 2. Chunks ────────────────────────────────────────────────────────────
-    let uploadedCount = 0;
+    // 2. Chunks — send one, wait for progress ack, then send next
     for (let i = 0; i < totalChunks; i++) {
       const start = i * CHUNK_SIZE;
       const slice = file.slice(start, Math.min(start + CHUNK_SIZE, file.size));
       const buf   = await slice.arrayBuffer();
       const cs    = await sha256hex(buf);
+      const b64   = toBase64(buf);
 
-      // Convert to base64 for JSON transport
-      const bytes   = new Uint8Array(buf);
-      let   binary  = '';
-      for (let b = 0; b < bytes.byteLength; b++) binary += String.fromCharCode(bytes[b]);
-      const base64 = btoa(binary);
-
-      await new Promise<void>((resolve, reject) => {
-        this.messageHandlers.set(fileUploadId, (msg) => {
-          if (msg.type === 'progress') {
-            uploadedCount++;
-            // FIX: emit progress with the task's relPath (not the server's file_name)
-            // so the UploadModal queue matcher can correctly identify this task.
-            onFileProgress({
-              fileUploadId,
-              fileName:       file.name,
-              relPath,                          // ← use task relPath, not server field
-              uploadedChunks: uploadedCount,
-              totalChunks,
-              percentage:     Math.round((uploadedCount / totalChunks) * 100),
-              status:         'uploading',
-            });
-            this.messageHandlers.delete(fileUploadId);
-            resolve();
-          } else if (msg.type === 'error') {
-            this.messageHandlers.delete(fileUploadId);
-            reject(new Error(msg.message as string));
-          }
-        });
-
-        this.send({
+      await sendAndWait(
+        ws,
+        {
           type: 'chunk',
           data: {
             file_upload_id: fileUploadId,
             chunk_index:    i,
             total_chunks:   totalChunks,
             checksum:       cs,
-            data:           base64,
+            data:           b64,
           },
-        });
+        },
+        ['progress'],
+      );
+
+      onProgress({
+        fileUploadId,
+        fileName:       file.name,
+        relPath,
+        uploadedChunks: i + 1,
+        totalChunks,
+        percentage:     Math.round(((i + 1) / totalChunks) * 100),
+        status:         'uploading',
       });
     }
 
-    // ── 3. Complete ──────────────────────────────────────────────────────────
-    await new Promise<void>((resolve, reject) => {
-      this.messageHandlers.set(fileUploadId, (msg) => {
-        if (msg.type === 'done') {
-          // FIX: emit completed progress with the task's relPath
-          onFileProgress({
-            fileUploadId,
-            fileName:       file.name,
-            relPath,                            // ← use task relPath
-            uploadedChunks: totalChunks,
-            totalChunks,
-            percentage:     100,
-            status:         'completed',
-          });
-          this.messageHandlers.delete(fileUploadId);
-          resolve();
-        } else if (msg.type === 'error') {
-          this.messageHandlers.delete(fileUploadId);
-          reject(new Error(msg.message as string));
-        }
-      });
+    // 3. Complete
+    await sendAndWait(
+      ws,
+      { type: 'complete', data: { file_upload_id: fileUploadId } },
+      ['done'],
+    );
 
-      this.send({
-        type: 'complete',
-        data: { file_upload_id: fileUploadId },
-      });
+    onProgress({
+      fileUploadId,
+      fileName:       file.name,
+      relPath,
+      uploadedChunks: totalChunks,
+      totalChunks,
+      percentage:     100,
+      status:         'completed',
     });
+  } finally {
+    ws.close();
   }
 }
 
-// ─── Convenience: upload a batch of tasks over one WS session ────────────────
+// ─── Public batch API ─────────────────────────────────────────────────────────
 
 export async function uploadBatch(
   tasks: UploadTask[],
@@ -224,25 +264,14 @@ export async function uploadBatch(
   onProgress: (p: UploadProgress) => void,
   onError: (msg: string) => void,
 ): Promise<void> {
-  const session = new UploadSession(token, onProgress, onError);
-  await session.open();
-
-  try {
-    // Upload sequentially — parallel support can be added later
-    for (const task of tasks) {
-      await session.uploadFile(task, folderId, onProgress);
+  for (const task of tasks) {
+    try {
+      await uploadOneFile(task, folderId, token, onProgress);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error('[upload] failed:', task.relPath || task.file.name, msg);
+      onError(`${task.relPath || task.file.name}: ${msg}`);
+      // Continue uploading remaining files even when one fails.
     }
-  } finally {
-    session.close();
   }
-}
-
-// ─── Helper: expand a FileList into tasks (handles folder drag-drop) ─────────
-
-export function filesToTasks(files: FileList): UploadTask[] {
-  return Array.from(files).map(f => ({
-    file:    f,
-    // webkitRelativePath is set when user picks a folder via <input webkitdirectory>
-    relPath: (f as File & { webkitRelativePath?: string }).webkitRelativePath ?? '',
-  }));
 }

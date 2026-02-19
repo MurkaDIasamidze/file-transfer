@@ -1,5 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { uploadBatch, filesToTasks } from '../../services/uploadService';
+import {
+  uploadBatch,
+  filesToTasks,
+  collectEntriesSync,
+  entriesToTasks,
+} from '../../services/uploadService';
 import type { UploadProgress, UploadTask } from '../../services/uploadService';
 import { useAuthStore } from '../../store/authStore';
 
@@ -18,44 +23,87 @@ interface QueueItem {
 }
 
 function fmtSize(b: number): string {
-  if (b < 1024) return `${b} B`;
-  if (b < 1048576) return `${(b / 1024).toFixed(1)} KB`;
-  if (b < 1073741824) return `${(b / 1048576).toFixed(1)} MB`;
-  return `${(b / 1073741824).toFixed(1)} GB`;
-}
-
-// FIX: match a queue item to a progress event by both relPath and fileName.
-// For folder uploads relPath is e.g. "myfolder/report.pdf"; for single files
-// relPath is '' and we fall back to fileName alone.
-function matchesTask(item: QueueItem, p: UploadProgress): boolean {
-  const taskKey  = item.task.relPath || item.task.file.name;
-  const progKey  = p.relPath         || p.fileName;
-  return taskKey === progKey;
+  if (b < 1024)          return `${b} B`;
+  if (b < 1_048_576)     return `${(b / 1024).toFixed(1)} KB`;
+  if (b < 1_073_741_824) return `${(b / 1_048_576).toFixed(1)} MB`;
+  return `${(b / 1_073_741_824).toFixed(1)} GB`;
 }
 
 export default function UploadModal({ folderId, onClose, onProgress, onComplete }: Props) {
   const token = useAuthStore(s => s.token)!;
+
   const [queue,    setQueue]    = useState<QueueItem[]>([]);
   const [dragging, setDragging] = useState(false);
   const [running,  setRunning]  = useState(false);
   const [mode,     setMode]     = useState<'files' | 'folder'>('files');
+
   const fileRef   = useRef<HTMLInputElement>(null);
   const folderRef = useRef<HTMLInputElement>(null);
 
-  const addFiles = useCallback((files: FileList | null) => {
-    if (!files) return;
-    const tasks = filesToTasks(files);
+  // Stable ref so the auto-close timer never needs onClose as a dependency
+  // (onClose is a new arrow fn every DrivePage render, which would keep
+  //  cancelling and restarting the timeout).
+  const onCloseRef = useRef(onClose);
+  useEffect(() => { onCloseRef.current = onClose; }, [onClose]);
+
+  // ── Add files to queue ─────────────────────────────────────────────────────
+
+  const enqueue = useCallback((tasks: UploadTask[]) => {
+    if (tasks.length === 0) return;
     setQueue(prev => [
       ...prev,
       ...tasks.map(task => ({ task, progress: null, error: null, done: false })),
     ]);
   }, []);
 
-  const handleDrop = useCallback((e: React.DragEvent) => {
+  // For <input> file / folder picker
+  const handleInputChange = useCallback((files: FileList | null) => {
+    if (!files) return;
+    enqueue(filesToTasks(files));
+  }, [enqueue]);
+
+  // ── Drag & drop ────────────────────────────────────────────────────────────
+  //
+  // IMPORTANT: webkitGetAsEntry() must be called synchronously inside the event
+  // handler before it returns — the DataTransfer object becomes invalid after.
+  // We snapshot the FileSystemEntry objects first, then resolve them async.
+
+  const handleDragOver = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+    setDragging(true);
+  }, []);
+
+  const handleDragLeave = useCallback((e: React.DragEvent) => {
+    // Only clear if leaving the drop zone itself, not a child element
+    if (e.currentTarget.contains(e.relatedTarget as Node)) return;
+    setDragging(false);
+  }, []);
+
+  const handleDrop = useCallback(async (e: React.DragEvent) => {
     e.preventDefault();
     setDragging(false);
-    addFiles(e.dataTransfer.files);
-  }, [addFiles]);
+
+    // Snapshot entries SYNCHRONOUSLY before the event handler returns
+    const entries = collectEntriesSync(e.dataTransfer);
+
+    if (entries.length > 0) {
+      // FileSystem API path — handles folders recursively
+      try {
+        const tasks = await entriesToTasks(entries);
+        enqueue(tasks);
+      } catch (err) {
+        console.error('[drop] failed to read entries:', err);
+        // Fall back to flat file list
+        enqueue(filesToTasks(e.dataTransfer.files));
+      }
+    } else {
+      // Browser doesn't support webkitGetAsEntry — fall back to flat file list
+      enqueue(filesToTasks(e.dataTransfer.files));
+    }
+  }, [enqueue]);
+
+  // ── Start upload ───────────────────────────────────────────────────────────
 
   const handleStart = async () => {
     if (queue.length === 0 || running) return;
@@ -63,57 +111,67 @@ export default function UploadModal({ folderId, onClose, onProgress, onComplete 
 
     const tasks = queue.map(q => q.task);
 
-    try {
-      await uploadBatch(
-        tasks,
-        folderId,
-        token,
-        (p) => {
-          // Bubble up to DrivePage for the top progress strip
-          onProgress(p);
+    await uploadBatch(
+      tasks,
+      folderId,
+      token,
+      (p: UploadProgress) => {
+        onProgress(p);
 
-          // FIX: use matchesTask so folder-upload items (relPath !== '') are found
-          setQueue(prev => prev.map(item =>
-            matchesTask(item, p)
-              ? { ...item, progress: p, done: p.status === 'completed' }
-              : item
-          ));
+        // Match by relPath (folder uploads) or fileName (plain files)
+        const key = p.relPath || p.fileName;
+        setQueue(prev => prev.map(item => {
+          const itemKey = item.task.relPath || item.task.file.name;
+          if (itemKey !== key) return item;
+          return { ...item, progress: p, done: p.status === 'completed' };
+        }));
 
-          // Refresh the file list as soon as each individual file completes
-          if (p.status === 'completed') {
-            onComplete();
-          }
-        },
-        (msg) => {
-          setQueue(prev => prev.map(item =>
-            !item.done && !item.error ? { ...item, error: msg } : item
-          ));
-        },
-      );
-    } catch (err) {
-      console.error('Upload batch failed', err);
-    } finally {
-      setRunning(false);
-    }
+        if (p.status === 'completed') onComplete();
+      },
+      (msg: string) => {
+        // Mark the first non-done, non-errored item as failed
+        setQueue(prev => {
+          let marked = false;
+          return prev.map(item => {
+            if (!marked && !item.done && !item.error) {
+              marked = true;
+              return { ...item, error: msg };
+            }
+            return item;
+          });
+        });
+      },
+    );
+
+    setRunning(false);
   };
 
-  const totalSize = queue.reduce((sum, q) => sum + q.task.file.size, 0);
-  const allDone   = queue.length > 0 && queue.every(q => q.done);
+  // ── Derived ────────────────────────────────────────────────────────────────
 
-  // FIX: auto-close the modal 1.5 s after all files finish uploading
+  const totalSize = queue.reduce((s, q) => s + q.task.file.size, 0);
+  const doneCount = queue.filter(q => q.done).length;
+  const allDone   = queue.length > 0 && doneCount === queue.length;
+
+  // Auto-close 1.5 s after everything finishes
   useEffect(() => {
     if (!allDone) return;
-    const t = setTimeout(() => onClose(), 1500);
+    const t = setTimeout(() => onCloseRef.current(), 1500);
     return () => clearTimeout(t);
-  }, [allDone, onClose]);
+  }, [allDone]); // stable — onClose accessed via ref
+
+  // ── Render ─────────────────────────────────────────────────────────────────
 
   return (
     <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/50 backdrop-blur-sm p-4">
       <div className="bg-white rounded-2xl shadow-2xl w-full max-w-lg">
+
         {/* Header */}
         <div className="flex items-center justify-between px-6 py-4 border-b border-gray-100">
           <h2 className="text-base font-semibold text-gray-900">Upload</h2>
-          <button onClick={onClose} className="w-7 h-7 flex items-center justify-center rounded-full hover:bg-gray-100 transition-colors">
+          <button
+            onClick={onClose}
+            className="w-7 h-7 flex items-center justify-center rounded-full hover:bg-gray-100 transition-colors"
+          >
             <svg className="w-4 h-4 text-gray-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
               <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12"/>
             </svg>
@@ -121,6 +179,7 @@ export default function UploadModal({ folderId, onClose, onProgress, onComplete 
         </div>
 
         <div className="p-6 space-y-4">
+
           {/* Mode tabs */}
           <div className="flex gap-1 p-1 bg-gray-100 rounded-xl">
             {(['files', 'folder'] as const).map(m => (
@@ -138,67 +197,81 @@ export default function UploadModal({ folderId, onClose, onProgress, onComplete 
 
           {/* Drop zone */}
           <div
-            onDragOver={e => { e.preventDefault(); setDragging(true); }}
-            onDragLeave={() => setDragging(false)}
+            onDragOver={handleDragOver}
+            onDragLeave={handleDragLeave}
             onDrop={handleDrop}
-            onClick={() => mode === 'folder' ? folderRef.current?.click() : fileRef.current?.click()}
-            className={`border-2 border-dashed rounded-xl p-8 text-center transition-all cursor-pointer ${
-              dragging ? 'border-blue-400 bg-blue-50 scale-[1.01]' : 'border-gray-200 hover:border-blue-300 hover:bg-blue-50/30'
+            onClick={() => (mode === 'folder' ? folderRef : fileRef).current?.click()}
+            className={`border-2 border-dashed rounded-xl p-8 text-center transition-all cursor-pointer select-none ${
+              dragging
+                ? 'border-blue-400 bg-blue-50 scale-[1.01]'
+                : 'border-gray-200 hover:border-blue-300 hover:bg-blue-50/30'
             }`}
           >
-            {/* Hidden inputs */}
             <input
               ref={fileRef}
               type="file"
               multiple
               className="hidden"
-              onChange={e => addFiles(e.target.files)}
+              onChange={e => handleInputChange(e.target.files)}
             />
             <input
               ref={folderRef}
               type="file"
-              // @ts-expect-error webkitdirectory is not in React's HTMLInputElement types
+              // @ts-expect-error – webkitdirectory not in React's types
               webkitdirectory=""
               multiple
               className="hidden"
-              onChange={e => addFiles(e.target.files)}
+              onChange={e => handleInputChange(e.target.files)}
             />
 
-            <div className="text-4xl mb-3">{mode === 'folder' ? '📁' : '📄'}</div>
+            <div className="text-4xl mb-3">{dragging ? '📂' : mode === 'folder' ? '📁' : '📄'}</div>
             <p className="text-sm font-medium text-gray-700">
-              {mode === 'folder' ? 'Click to select a folder' : 'Click to browse files'}
+              {dragging
+                ? 'Drop to add files…'
+                : mode === 'folder'
+                ? 'Click to select a folder, or drag & drop one here'
+                : 'Click to browse files, or drag & drop here'}
             </p>
-            <p className="text-xs text-gray-400 mt-1">or drag & drop here</p>
+            <p className="text-xs text-gray-400 mt-1">
+              Folders are supported via drag & drop
+            </p>
           </div>
 
-          {/* Queue */}
+          {/* Queue list */}
           {queue.length > 0 && (
             <div className="space-y-1.5 max-h-52 overflow-y-auto">
               <div className="flex items-center justify-between text-xs text-gray-400 mb-2">
-                <span>{queue.length} file{queue.length > 1 ? 's' : ''}</span>
+                <span>{queue.length} file{queue.length !== 1 ? 's' : ''}</span>
                 <span>{fmtSize(totalSize)}</span>
               </div>
-              {queue.map((item) => {
-                const displayName = item.task.relPath || item.task.file.name;
+
+              {queue.map(item => {
+                const key  = item.task.relPath || item.task.file.name;
+                const pct  = item.progress?.percentage ?? 0;
+                const icon = item.done ? '✅' : item.error ? '❌' : '📄';
+
                 return (
-                  <div key={`${item.task.relPath || item.task.file.name}-${item.task.file.size}`} className="flex items-center gap-2.5 text-sm bg-gray-50 rounded-lg px-3 py-2">
-                    <span className="text-base shrink-0">
-                      {item.done ? '✅' : item.error ? '❌' : '📄'}
-                    </span>
+                  <div key={key} className="flex items-center gap-2.5 bg-gray-50 rounded-lg px-3 py-2">
+                    <span className="text-base shrink-0">{icon}</span>
+
                     <div className="flex-1 min-w-0">
-                      <p className="truncate text-gray-700 text-xs font-medium">{displayName}</p>
+                      <p className="truncate text-gray-700 text-xs font-medium">{key}</p>
                       {item.progress && !item.done && (
                         <div className="mt-1 h-1 bg-gray-200 rounded-full overflow-hidden">
                           <div
-                            className="h-full bg-blue-500 transition-all duration-300 rounded-full"
-                            style={{ width: `${item.progress.percentage}%` }}
+                            className="h-full bg-blue-500 transition-all duration-200 rounded-full"
+                            style={{ width: `${pct}%` }}
                           />
                         </div>
                       )}
                       {item.error && <p className="text-xs text-red-500 mt-0.5">{item.error}</p>}
                     </div>
-                    <span className="text-xs text-gray-400 shrink-0">
-                      {item.done ? 'Done' : item.progress ? `${item.progress.percentage}%` : fmtSize(item.task.file.size)}
+
+                    <span className="text-xs text-gray-400 shrink-0 w-12 text-right">
+                      {item.done   ? 'Done'
+                      : item.error ? 'Failed'
+                      : item.progress ? `${pct}%`
+                      : fmtSize(item.task.file.size)}
                     </span>
                   </div>
                 );
@@ -206,17 +279,17 @@ export default function UploadModal({ folderId, onClose, onProgress, onComplete 
             </div>
           )}
 
-          {/* All done feedback before auto-close */}
+          {/* All-done banner */}
           {allDone && (
             <div className="flex items-center gap-2 text-sm text-green-700 bg-green-50 px-4 py-2.5 rounded-xl border border-green-100">
               <svg className="w-4 h-4 shrink-0" fill="currentColor" viewBox="0 0 20 20">
                 <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd"/>
               </svg>
-              All files uploaded! Closing…
+              All {queue.length} file{queue.length !== 1 ? 's' : ''} uploaded — closing…
             </div>
           )}
 
-          {/* Actions */}
+          {/* Action buttons */}
           <div className="flex gap-3 pt-1">
             <button
               onClick={onClose}
@@ -224,6 +297,7 @@ export default function UploadModal({ folderId, onClose, onProgress, onComplete 
             >
               {allDone ? 'Close' : 'Cancel'}
             </button>
+
             {!allDone && (
               <button
                 onClick={handleStart}
@@ -236,10 +310,14 @@ export default function UploadModal({ folderId, onClose, onProgress, onComplete 
                     <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"/>
                   </svg>
                 )}
-                {running ? 'Uploading…' : `Upload${queue.length > 0 ? ` (${queue.length})` : ''}`}
+                {running
+                  ? `Uploading… (${doneCount}/${queue.length})`
+                  : `Upload${queue.length > 0 ? ` (${queue.length})` : ''}`
+                }
               </button>
             )}
           </div>
+
         </div>
       </div>
     </div>
