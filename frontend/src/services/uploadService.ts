@@ -1,178 +1,248 @@
-import { filesApi } from './api';
+// uploadService.ts — WebSocket-based upload (files + folders)
+
+const WS_BASE   = (import.meta.env.VITE_WS_URL ?? 'ws://localhost:8081').replace(/\/$/, '');
+const CHUNK_SIZE = parseInt(import.meta.env.VITE_CHUNK_SIZE ?? '262144'); // 256 KB default
 
 export interface UploadProgress {
   fileUploadId:   number;
   fileName:       string;
+  relPath:        string;
   uploadedChunks: number;
   totalChunks:    number;
   percentage:     number;
-  status:         string;
+  status:         'pending' | 'uploading' | 'completed' | 'failed';
 }
 
-const CHUNK_SIZE = parseInt(import.meta.env.VITE_CHUNK_SIZE ?? '1048576');
-const WS_BASE    = import.meta.env.VITE_WS_URL ?? 'ws://localhost:8081';
-const MAX_RETRY  = 3;
+export interface UploadTask {
+  file:    File;
+  relPath: string; // '' for single file, 'dir/sub/file.txt' for folder
+}
 
 async function sha256hex(buf: ArrayBuffer): Promise<string> {
   const hash = await crypto.subtle.digest('SHA-256', buf);
   return Array.from(new Uint8Array(hash))
-    .map((b) => b.toString(16).padStart(2, '0'))
+    .map(b => b.toString(16).padStart(2, '0'))
     .join('');
 }
 
-export class UploadService {
-  private ws?:        WebSocket;
-  private reconnects  = 0;
-  private done        = false; // guard — stops reconnect loop after upload completes
+// ─── Single connection shared across an upload session ───────────────────────
+
+export class UploadSession {
+  private ws!: WebSocket;
+  private ready  = false;
+  private queue: Array<() => void> = [];
+  private messageHandlers = new Map<number, (msg: Record<string, unknown>) => void>();
 
   constructor(
+    private token: string,
     private onProgress: (p: UploadProgress) => void,
-    private onComplete: () => void,
-    private onError:    (msg: string) => void,
+    private onError: (msg: string) => void,
   ) {}
 
-  async upload(file: File, folderId?: number | null): Promise<void> {
-    const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+  async open(): Promise<void> {
+    return new Promise((resolve, reject) => {
+      this.ws = new WebSocket(`${WS_BASE}/ws/upload?token=${this.token}`);
+      this.ws.binaryType = 'arraybuffer';
+
+      this.ws.onopen = () => {
+        this.ready = true;
+        this.queue.forEach(fn => fn());
+        this.queue = [];
+        resolve();
+      };
+
+      this.ws.onerror = () => reject(new Error('WebSocket connection failed'));
+
+      this.ws.onmessage = (ev) => {
+        try {
+          const msg = JSON.parse(ev.data as string) as Record<string, unknown>;
+          const type = msg.type as string;
+
+          if (type === 'error') {
+            this.onError(msg.message as string);
+          }
+
+          // Extract file_upload_id — it lives at the top level for most messages
+          // (progress, error) but is nested inside `file.id` for `done` messages
+          // because the server sends: { type: "done", file: { id: X, ... } }
+          let fileId = msg.file_upload_id as number | undefined;
+          if (!fileId && type === 'done') {
+            const fileObj = msg.file as Record<string, unknown> | undefined;
+            fileId = fileObj?.id as number | undefined;
+          }
+
+          if (fileId && this.messageHandlers.has(fileId)) {
+            this.messageHandlers.get(fileId)!(msg);
+          } else if (type === 'init_ack') {
+            // init_ack routes via temp key -1 (we don't know the ID until we receive it)
+            this.messageHandlers.get(-1)?.(msg);
+          }
+        } catch { /* ignore malformed */ }
+      };
+
+      this.ws.onclose = () => {
+        this.ready = false;
+      };
+    });
+  }
+
+  close() {
+    this.ws?.close();
+  }
+
+  private send(data: unknown) {
+    const fn = () => this.ws.send(JSON.stringify(data));
+    if (this.ready) fn();
+    else this.queue.push(fn);
+  }
+
+  // ── Upload a single file task ─────────────────────────────────────────────
+
+  async uploadFile(
+    task: UploadTask,
+    folderId: number | null,
+    onFileProgress: (p: UploadProgress) => void,
+  ): Promise<void> {
+    const { file, relPath } = task;
     const fileBuf     = await file.arrayBuffer();
     const checksum    = await sha256hex(fileBuf);
+    const totalChunks = Math.ceil(file.size / CHUNK_SIZE) || 1;
 
-    const { data } = await filesApi.initUpload({
-      file_name:    file.name,
-      file_type:    file.type,
-      file_size:    file.size,
-      total_chunks: totalChunks,
-      checksum,
-      folder_id:    folderId ?? null,
+    // ── 1. Init ─────────────────────────────────────────────────────────────
+    const fileUploadId: number = await new Promise((resolve, reject) => {
+      // Temporary handler for init_ack — keyed by -1 since we don't have the
+      // file_upload_id yet. Cleared immediately upon receipt.
+      this.messageHandlers.set(-1, (msg) => {
+        if (msg.type === 'init_ack') {
+          this.messageHandlers.delete(-1);
+          resolve(msg.file_upload_id as number);
+        } else if (msg.type === 'error') {
+          this.messageHandlers.delete(-1);
+          reject(new Error(msg.message as string));
+        }
+      });
+
+      this.send({
+        type: 'init',
+        data: {
+          file_name:  file.name,
+          file_type:  file.type,
+          file_size:  file.size,
+          checksum,
+          folder_id:  folderId,
+          rel_path:   relPath,
+        },
+      });
     });
 
-    const fileId = data.file_upload_id;
-    this.openWS(fileId, file.name, totalChunks);
+    // ── 2. Chunks ────────────────────────────────────────────────────────────
+    let uploadedCount = 0;
+    for (let i = 0; i < totalChunks; i++) {
+      const start = i * CHUNK_SIZE;
+      const slice = file.slice(start, Math.min(start + CHUNK_SIZE, file.size));
+      const buf   = await slice.arrayBuffer();
+      const cs    = await sha256hex(buf);
 
-    await this.sendChunks(file, fileId, totalChunks);
-    await filesApi.complete(fileId);
+      // Convert to base64 for JSON transport
+      const bytes   = new Uint8Array(buf);
+      let   binary  = '';
+      for (let b = 0; b < bytes.byteLength; b++) binary += String.fromCharCode(bytes[b]);
+      const base64 = btoa(binary);
 
-    // Mark done BEFORE closing so the onclose handler doesn't reconnect
-    this.done = true;
-    this.ws?.close();
-
-    this.onProgress({
-      fileUploadId:   fileId,
-      fileName:       file.name,
-      uploadedChunks: totalChunks,
-      totalChunks,
-      percentage:     100,
-      status:         'completed',
-    });
-
-    this.onComplete();
-  }
-
-  private async sendChunks(file: File, fileId: number, total: number): Promise<void> {
-    const done    = new Set<number>();
-    let   retries = 0;
-
-    while (done.size < total) {
-      for (let i = 0; i < total; i++) {
-        if (done.has(i)) continue;
-        try {
-          const start = i * CHUNK_SIZE;
-          const slice = file.slice(start, Math.min(start + CHUNK_SIZE, file.size));
-          const buf   = await slice.arrayBuffer();
-          const cs    = await sha256hex(buf);
-
-          const form = new FormData();
-          form.append('file_upload_id', String(fileId));
-          form.append('chunk_index',    String(i));
-          form.append('checksum',       cs);
-          form.append('chunk',          new Blob([buf]));
-
-          await filesApi.uploadChunk(form);
-          done.add(i);
-
-          // Emit progress from client side immediately after each chunk
-          // (don't wait for WS — it may be slightly behind)
-          this.onProgress({
-            fileUploadId:   fileId,
-            fileName:       file.name,
-            uploadedChunks: done.size,
-            totalChunks:    total,
-            percentage:     Math.round((done.size / total) * 100),
-            status:         'uploading',
-          });
-
-          // Server-side verification every 10 chunks
-          if (done.size % 10 === 0) {
-            await this.verifyWithServer(fileId, done);
+      await new Promise<void>((resolve, reject) => {
+        this.messageHandlers.set(fileUploadId, (msg) => {
+          if (msg.type === 'progress') {
+            uploadedCount++;
+            // FIX: emit progress with the task's relPath (not the server's file_name)
+            // so the UploadModal queue matcher can correctly identify this task.
+            onFileProgress({
+              fileUploadId,
+              fileName:       file.name,
+              relPath,                          // ← use task relPath, not server field
+              uploadedChunks: uploadedCount,
+              totalChunks,
+              percentage:     Math.round((uploadedCount / totalChunks) * 100),
+              status:         'uploading',
+            });
+            this.messageHandlers.delete(fileUploadId);
+            resolve();
+          } else if (msg.type === 'error') {
+            this.messageHandlers.delete(fileUploadId);
+            reject(new Error(msg.message as string));
           }
-        } catch (err) {
-          console.warn(`chunk ${i} failed`, err);
-        }
-      }
+        });
 
-      if (done.size < total) {
-        retries++;
-        if (retries >= MAX_RETRY) {
-          this.onError('Upload failed after max retries');
-          throw new Error('max retries exceeded');
-        }
-        await sleep(1000 * retries);
-      }
-    }
-  }
-
-  private async verifyWithServer(fileId: number, done: Set<number>): Promise<void> {
-    try {
-      const { data } = await filesApi.verify(fileId);
-      const srv = new Set(data.uploaded_chunks);
-      for (const i of [...done]) {
-        if (!srv.has(i)) done.delete(i);
-      }
-    } catch {
-      // non-fatal — retry will catch missing chunks
-    }
-  }
-
-  private openWS(fileId: number, fileName: string, totalChunks: number): void {
-    try {
-      this.ws = new WebSocket(`${WS_BASE}/ws/upload/${fileId}`);
-    } catch {
-      // WS is optional — upload proceeds via HTTP chunks regardless
-      return;
+        this.send({
+          type: 'chunk',
+          data: {
+            file_upload_id: fileUploadId,
+            chunk_index:    i,
+            total_chunks:   totalChunks,
+            checksum:       cs,
+            data:           base64,
+          },
+        });
+      });
     }
 
-    this.ws.onmessage = (ev) => {
-      try {
-        const msg = JSON.parse(ev.data as string);
-        if (msg.type === 'progress') {
-          this.onProgress({
-            fileUploadId:   msg.file_upload_id,
-            fileName:       msg.file_name ?? fileName,
-            uploadedChunks: msg.uploaded_chunks,
-            totalChunks:    msg.total_chunks ?? totalChunks,
-            percentage:     Math.round(msg.progress_percent),
-            status:         msg.status,
+    // ── 3. Complete ──────────────────────────────────────────────────────────
+    await new Promise<void>((resolve, reject) => {
+      this.messageHandlers.set(fileUploadId, (msg) => {
+        if (msg.type === 'done') {
+          // FIX: emit completed progress with the task's relPath
+          onFileProgress({
+            fileUploadId,
+            fileName:       file.name,
+            relPath,                            // ← use task relPath
+            uploadedChunks: totalChunks,
+            totalChunks,
+            percentage:     100,
+            status:         'completed',
           });
+          this.messageHandlers.delete(fileUploadId);
+          resolve();
+        } else if (msg.type === 'error') {
+          this.messageHandlers.delete(fileUploadId);
+          reject(new Error(msg.message as string));
         }
-      } catch {
-        // ignore malformed WS messages
-      }
-    };
+      });
 
-    this.ws.onerror = () => {
-      // WS error is non-fatal — chunks still upload via HTTP
-      console.warn('WebSocket error — progress updates may be delayed');
-    };
-
-    this.ws.onclose = () => {
-      // Only reconnect if upload is still in progress and under retry limit
-      if (!this.done && this.reconnects < 3) {
-        this.reconnects++;
-        setTimeout(() => {
-          if (!this.done) this.openWS(fileId, fileName, totalChunks);
-        }, 2000);
-      }
-    };
+      this.send({
+        type: 'complete',
+        data: { file_upload_id: fileUploadId },
+      });
+    });
   }
 }
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+// ─── Convenience: upload a batch of tasks over one WS session ────────────────
+
+export async function uploadBatch(
+  tasks: UploadTask[],
+  folderId: number | null,
+  token: string,
+  onProgress: (p: UploadProgress) => void,
+  onError: (msg: string) => void,
+): Promise<void> {
+  const session = new UploadSession(token, onProgress, onError);
+  await session.open();
+
+  try {
+    // Upload sequentially — parallel support can be added later
+    for (const task of tasks) {
+      await session.uploadFile(task, folderId, onProgress);
+    }
+  } finally {
+    session.close();
+  }
+}
+
+// ─── Helper: expand a FileList into tasks (handles folder drag-drop) ─────────
+
+export function filesToTasks(files: FileList): UploadTask[] {
+  return Array.from(files).map(f => ({
+    file:    f,
+    // webkitRelativePath is set when user picks a folder via <input webkitdirectory>
+    relPath: (f as File & { webkitRelativePath?: string }).webkitRelativePath ?? '',
+  }));
+}

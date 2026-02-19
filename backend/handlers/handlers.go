@@ -1,6 +1,10 @@
 package handlers
 
 import (
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
 	"file-transfer-backend/config"
 	"file-transfer-backend/middleware"
 	"file-transfer-backend/models"
@@ -12,18 +16,327 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/websocket/v2"
 )
+
+// ─── Message types ────────────────────────────────────────────────────────────
+
+type wsMsg struct {
+	Type string          `json:"type"`
+	Data json.RawMessage `json:"data"`
+}
+
+// client → server
+type initMsg struct {
+	FileName  string `json:"file_name"`
+	FileType  string `json:"file_type"`
+	FileSize  int64  `json:"file_size"`
+	Checksum  string `json:"checksum"`
+	FolderID  *uint  `json:"folder_id"`
+	RelPath   string `json:"rel_path"` // for folder uploads, e.g. "docs/report.pdf"
+}
+
+type chunkMsg struct {
+	FileUploadID uint   `json:"file_upload_id"`
+	ChunkIndex   int    `json:"chunk_index"`
+	TotalChunks  int    `json:"total_chunks"`
+	Checksum     string `json:"checksum"`
+	Data         string `json:"data"` // base64-encoded bytes
+}
+
+type completeMsg struct {
+	FileUploadID uint `json:"file_upload_id"`
+}
+
+// server → client
+type progressMsg struct {
+	Type         string  `json:"type"`
+	FileUploadID uint    `json:"file_upload_id"`
+	FileName     string  `json:"file_name"`
+	Uploaded     int     `json:"uploaded_chunks"`
+	Total        int     `json:"total_chunks"`
+	Percent      float64 `json:"progress_percent"`
+	Status       string  `json:"status"`
+}
+
+type errorMsg struct {
+	Type    string `json:"type"`
+	Message string `json:"message"`
+}
+
+type doneMsg struct {
+	Type string             `json:"type"`
+	File *models.FileUpload `json:"file"`
+}
+
+// ─── Handler ──────────────────────────────────────────────────────────────────
+
+type UploadWSHandler struct {
+	repo types.IFileRepository
+	cs   types.IChecksumService
+	fs   types.IFileService
+	cfg  *config.UploadConfig
+	mu   sync.Mutex
+}
+
+func NewUploadWSHandler(
+	repo types.IFileRepository,
+	cs types.IChecksumService,
+	fs types.IFileService,
+	cfg *config.UploadConfig,
+) *UploadWSHandler {
+	return &UploadWSHandler{repo: repo, cs: cs, fs: fs, cfg: cfg}
+}
+
+// HandleUpload is the WebSocket handler mounted at /ws/upload
+func (h *UploadWSHandler) HandleUpload(conn *websocket.Conn) {
+	// Authenticate via query-string token (WS can't set headers)
+	// The JWT middleware already validated the token before upgrade,
+	// so we read the user ID stored in Locals by the middleware.
+	uid := middleware.WSUserID(conn.Locals)
+
+	slog.Info("ws upload connected", "user", uid)
+	defer conn.Close()
+
+	// Per-connection state
+	chunks := make(map[uint]map[int][]byte) // fileID → chunkIdx → data
+	totals := make(map[uint]int)
+
+	for {
+		_, raw, err := conn.ReadMessage()
+		if err != nil {
+			slog.Info("ws upload disconnected", "user", uid)
+			return
+		}
+
+		var msg wsMsg
+		if err := json.Unmarshal(raw, &msg); err != nil {
+			h.sendError(conn, "invalid message format")
+			continue
+		}
+
+		switch msg.Type {
+		case "init":
+			h.handleInit(conn, uid, msg.Data, chunks, totals)
+		case "chunk":
+			h.handleChunk(conn, uid, msg.Data, chunks, totals)
+		case "complete":
+			h.handleComplete(conn, uid, msg.Data, chunks)
+		default:
+			h.sendError(conn, "unknown message type: "+msg.Type)
+		}
+	}
+}
+
+func (h *UploadWSHandler) handleInit(
+	conn *websocket.Conn, uid uint,
+	data json.RawMessage,
+	chunks map[uint]map[int][]byte,
+	totals map[uint]int,
+) {
+	var req initMsg
+	if err := json.Unmarshal(data, &req); err != nil {
+		h.sendError(conn, "invalid init payload")
+		return
+	}
+
+	fu := &models.FileUpload{
+		UserID:   uid,
+		FolderID: req.FolderID,
+		FileName: req.FileName,
+		FileType: req.FileType,
+		FileSize: req.FileSize,
+		Checksum: req.Checksum,
+		Status:   "pending",
+		RelPath:  req.RelPath,
+	}
+
+	// For folder uploads: TotalChunks is set when we receive the first chunk
+	// We'll update it on first chunk arrival. Start at 0.
+	if err := h.repo.Create(fu); err != nil {
+		slog.Error("ws init create", "err", err)
+		h.sendError(conn, "failed to init upload")
+		return
+	}
+
+	chunks[fu.ID] = make(map[int][]byte)
+	slog.Info("ws upload init", "file", fu.ID, "name", req.FileName)
+
+	conn.WriteJSON(map[string]interface{}{
+		"type":           "init_ack",
+		"file_upload_id": fu.ID,
+		"file_name":      fu.FileName,
+	})
+}
+
+func (h *UploadWSHandler) handleChunk(
+	conn *websocket.Conn, uid uint,
+	data json.RawMessage,
+	chunks map[uint]map[int][]byte,
+	totals map[uint]int,
+) {
+	var req chunkMsg
+	if err := json.Unmarshal(data, &req); err != nil {
+		h.sendError(conn, "invalid chunk payload")
+		return
+	}
+
+	// Decode base64 payload
+	rawData, err := base64.StdEncoding.DecodeString(req.Data)
+	if err != nil {
+		h.sendError(conn, fmt.Sprintf("invalid base64 in chunk %d", req.ChunkIndex))
+		return
+	}
+
+	// Verify checksum
+	sum := sha256.Sum256(rawData)
+	actual := hex.EncodeToString(sum[:])
+	if actual != req.Checksum {
+		h.sendError(conn, fmt.Sprintf("checksum mismatch chunk %d", req.ChunkIndex))
+		return
+	}
+
+	fileChunks, ok := chunks[req.FileUploadID]
+	if !ok {
+		h.sendError(conn, "unknown file_upload_id — send init first")
+		return
+	}
+
+	fileChunks[req.ChunkIndex] = rawData
+	totals[req.FileUploadID] = req.TotalChunks
+
+	// Update status to uploading
+	if fu, err := h.repo.GetByID(req.FileUploadID); err == nil {
+		if fu.TotalChunks == 0 {
+			fu.TotalChunks = req.TotalChunks
+		}
+		fu.Status = "uploading"
+		h.repo.Update(fu)
+	}
+
+	uploaded := len(fileChunks)
+	pct := float64(uploaded) / float64(req.TotalChunks) * 100
+
+	conn.WriteJSON(progressMsg{
+		Type:         "progress",
+		FileUploadID: req.FileUploadID,
+		Uploaded:     uploaded,
+		Total:        req.TotalChunks,
+		Percent:      pct,
+		Status:       "uploading",
+	})
+}
+
+func (h *UploadWSHandler) handleComplete(
+	conn *websocket.Conn, uid uint,
+	data json.RawMessage,
+	chunks map[uint]map[int][]byte,
+) {
+	var req completeMsg
+	if err := json.Unmarshal(data, &req); err != nil {
+		h.sendError(conn, "invalid complete payload")
+		return
+	}
+
+	fu, err := h.repo.GetByID(req.FileUploadID)
+	if err != nil {
+		h.sendError(conn, "file upload not found")
+		return
+	}
+	if fu.UserID != uid {
+		h.sendError(conn, "forbidden")
+		return
+	}
+
+	fileChunks, ok := chunks[req.FileUploadID]
+	if !ok || len(fileChunks) == 0 {
+		h.sendError(conn, "no chunks received")
+		return
+	}
+
+	total := fu.TotalChunks
+	if total == 0 {
+		total = len(fileChunks)
+		fu.TotalChunks = total
+	}
+
+	// Build output path — respect rel_path for folder uploads
+	userDir := filepath.Join(h.cfg.Directory, strconv.FormatUint(uint64(uid), 10))
+	if fu.FolderID != nil {
+		userDir = filepath.Join(userDir, strconv.FormatUint(uint64(*fu.FolderID), 10))
+	}
+
+	var outPath string
+	if fu.RelPath != "" {
+		outPath = filepath.Join(userDir, filepath.FromSlash(fu.RelPath))
+	} else {
+		outPath = filepath.Join(userDir, fu.FileName)
+	}
+
+	if err := os.MkdirAll(filepath.Dir(outPath), os.ModePerm); err != nil {
+		h.sendError(conn, "mkdir failed")
+		return
+	}
+
+	// Reconstruct from in-memory chunks
+	f, err := os.Create(outPath)
+	if err != nil {
+		h.sendError(conn, "create file failed")
+		return
+	}
+
+	for i := 0; i < total; i++ {
+		chunk, found := fileChunks[i]
+		if !found {
+			f.Close()
+			h.sendError(conn, fmt.Sprintf("missing chunk %d", i))
+			return
+		}
+		f.Write(chunk)
+	}
+	f.Close()
+
+	// Verify whole-file checksum
+	fileData, err := os.ReadFile(outPath)
+	if err != nil {
+		h.sendError(conn, "read file failed")
+		return
+	}
+	sum := sha256.Sum256(fileData)
+	actual := hex.EncodeToString(sum[:])
+	if actual != fu.Checksum {
+		fu.Status = "failed"
+		h.repo.Update(fu)
+		h.sendError(conn, "file checksum mismatch")
+		return
+	}
+
+	fu.Status = "completed"
+	fu.FilePath = outPath
+	h.repo.Update(fu)
+
+	// Free memory
+	delete(chunks, req.FileUploadID)
+
+	slog.Info("ws upload complete", "file", fu.ID, "name", fu.FileName)
+
+	conn.WriteJSON(doneMsg{Type: "done", File: fu})
+}
+
+func (h *UploadWSHandler) sendError(conn *websocket.Conn, msg string) {
+	conn.WriteJSON(errorMsg{Type: "error", Message: msg})
+}
+
+// ─── REST fallback (for verify) ───────────────────────────────────────────────
 
 type FileHandler struct {
 	repo      types.IFileRepository
 	cs        types.IChecksumService
 	fs        types.IFileService
 	cfg       *config.UploadConfig
-	wsClients map[uint]map[*websocket.Conn]bool
-	wsMu      sync.RWMutex
 }
 
 func NewFileHandler(
@@ -32,174 +345,7 @@ func NewFileHandler(
 	fs types.IFileService,
 	cfg *config.UploadConfig,
 ) types.IFileHandler {
-	return &FileHandler{
-		repo:      repo,
-		cs:        cs,
-		fs:        fs,
-		cfg:       cfg,
-		wsClients: make(map[uint]map[*websocket.Conn]bool),
-	}
-}
-
-type initUploadReq struct {
-	FileName    string `json:"file_name"    validate:"required"`
-	FileType    string `json:"file_type"`
-	FileSize    int64  `json:"file_size"    validate:"required"`
-	TotalChunks int    `json:"total_chunks" validate:"required"`
-	Checksum    string `json:"checksum"     validate:"required"`
-	FolderID    *uint  `json:"folder_id"`
-}
-
-type completeReq struct {
-	FileUploadID uint `json:"file_upload_id" validate:"required"`
-}
-
-func (h *FileHandler) InitUpload(c *fiber.Ctx) error {
-	uid := middleware.UserIDFromToken(c)
-	var req initUploadReq
-	if err := utils.BindAndValidate(c, &req); err != nil {
-		return utils.Respond(c, err)
-	}
-	fu := &models.FileUpload{
-		UserID:      uid,
-		FolderID:    req.FolderID,
-		FileName:    req.FileName,
-		FileType:    req.FileType,
-		FileSize:    req.FileSize,
-		TotalChunks: req.TotalChunks,
-		Checksum:    req.Checksum,
-		Status:      "pending",
-	}
-	if err := h.repo.Create(fu); err != nil {
-		slog.Error("init upload", "err", err)
-		return utils.Respond(c, utils.NewError(fiber.StatusInternalServerError, "failed"))
-	}
-	slog.Info("upload init", "file", fu.ID, "user", uid)
-	return c.Status(fiber.StatusCreated).JSON(fiber.Map{"file_upload_id": fu.ID})
-}
-
-func (h *FileHandler) UploadChunk(c *fiber.Ctx) error {
-	uid := middleware.UserIDFromToken(c)
-	fileID, err := parseUint(c.FormValue("file_upload_id"))
-	if err != nil {
-		return utils.Respond(c, utils.NewError(fiber.StatusBadRequest, "invalid file_upload_id"))
-	}
-	idx, err := strconv.Atoi(c.FormValue("chunk_index"))
-	if err != nil {
-		return utils.Respond(c, utils.NewError(fiber.StatusBadRequest, "invalid chunk_index"))
-	}
-	checksum := c.FormValue("checksum")
-	if checksum == "" {
-		return utils.Respond(c, utils.NewError(fiber.StatusBadRequest, "checksum required"))
-	}
-	fh, err := c.FormFile("chunk")
-	if err != nil {
-		return utils.Respond(c, utils.NewError(fiber.StatusBadRequest, "chunk required"))
-	}
-	f, err := fh.Open()
-	if err != nil {
-		return utils.Respond(c, utils.NewError(fiber.StatusInternalServerError, "open chunk"))
-	}
-	defer f.Close()
-
-	data := make([]byte, fh.Size)
-	if _, err = f.Read(data); err != nil {
-		return utils.Respond(c, utils.NewError(fiber.StatusInternalServerError, "read chunk"))
-	}
-	if !h.cs.Verify(data, checksum) {
-		slog.Warn("checksum mismatch", "file", fileID, "idx", idx, "user", uid)
-		return utils.Respond(c, utils.NewError(fiber.StatusBadRequest, "checksum mismatch"))
-	}
-
-	existing, err := h.repo.GetChunk(fileID, idx)
-	if err == nil {
-		existing.Data = data
-		existing.Checksum = checksum
-		existing.ChunkSize = len(data)
-		existing.Status = "verified"
-		h.repo.UpdateChunk(existing)
-	} else {
-		ch := &models.FileChunk{
-			FileUploadID: fileID,
-			ChunkIndex:   idx,
-			ChunkSize:    len(data),
-			Checksum:     checksum,
-			Status:       "verified",
-			Data:         data,
-		}
-		if err := h.repo.CreateChunk(ch); err != nil {
-			slog.Error("create chunk", "file", fileID, "idx", idx, "err", err)
-			return utils.Respond(c, utils.NewError(fiber.StatusInternalServerError, "save"))
-		}
-	}
-
-	if fu, e := h.repo.GetByID(fileID); e == nil {
-		fu.Status = "uploading"
-		h.repo.Update(fu)
-	}
-	go h.broadcastProgress(fileID)
-	slog.Debug("chunk ok", "file", fileID, "idx", idx)
-	return c.JSON(fiber.Map{"chunk_index": idx})
-}
-
-func (h *FileHandler) CompleteUpload(c *fiber.Ctx) error {
-	uid := middleware.UserIDFromToken(c)
-	var req completeReq
-	if err := utils.BindAndValidate(c, &req); err != nil {
-		return utils.Respond(c, err)
-	}
-	fu, err := h.repo.GetByID(req.FileUploadID)
-	if err != nil {
-		return utils.Respond(c, utils.NewError(fiber.StatusNotFound, "upload not found"))
-	}
-	if fu.UserID != uid {
-		return utils.Respond(c, utils.NewError(fiber.StatusForbidden, "forbidden"))
-	}
-	chunks, err := h.repo.GetChunksByFileID(req.FileUploadID)
-	if err != nil {
-		return utils.Respond(c, utils.NewError(fiber.StatusInternalServerError, "fetch chunks"))
-	}
-	if len(chunks) != fu.TotalChunks {
-		return utils.Respond(c, utils.NewError(fiber.StatusBadRequest,
-			fmt.Sprintf("need %d chunks, got %d", fu.TotalChunks, len(chunks))))
-	}
-
-	userDir := filepath.Join(h.cfg.Directory, fmt.Sprintf("%d", uid))
-	if fu.FolderID != nil {
-		userDir = filepath.Join(userDir, fmt.Sprintf("%d", *fu.FolderID))
-	}
-	os.MkdirAll(userDir, os.ModePerm)
-
-	outPath := filepath.Join(userDir, fu.FileName)
-	if err := h.fs.Reconstruct(fu, chunks, outPath); err != nil {
-		slog.Error("reconstruct file", "file", fu.ID, "err", err)
-		return utils.Respond(c, err)
-	}
-	ok, err := h.fs.VerifyFile(outPath, fu.Checksum)
-	if err != nil || !ok {
-		slog.Error("verify file", "file", fu.ID, "err", err)
-		fu.Status = "failed"
-		h.repo.Update(fu)
-		return utils.Respond(c, utils.NewError(fiber.StatusBadRequest, "checksum failed"))
-	}
-	fu.Status = "completed"
-	fu.FilePath = outPath
-	h.repo.Update(fu)
-	go h.broadcastProgress(req.FileUploadID)
-	slog.Info("upload done", "file", fu.ID)
-	return c.JSON(fiber.Map{"file": fu})
-}
-
-func (h *FileHandler) VerifyChunks(c *fiber.Ctx) error {
-	id, err := parseUint(c.Params("id"))
-	if err != nil {
-		return utils.Respond(c, utils.NewError(fiber.StatusBadRequest, "invalid id"))
-	}
-	idx, err := h.repo.GetVerifiedChunkIndices(id)
-	if err != nil {
-		return utils.Respond(c, utils.NewError(fiber.StatusInternalServerError, "verify"))
-	}
-	return c.JSON(fiber.Map{"uploaded_chunks": idx, "total": len(idx)})
+	return &FileHandler{repo: repo, cs: cs, fs: fs, cfg: cfg}
 }
 
 func (h *FileHandler) ListFiles(c *fiber.Ctx) error {
@@ -213,7 +359,6 @@ func (h *FileHandler) ListFiles(c *fiber.Ctx) error {
 	}
 	files, err := h.repo.ListByFolder(uid, folderID)
 	if err != nil {
-		slog.Error("list files", "user", uid, "err", err)
 		return utils.Respond(c, utils.NewError(fiber.StatusInternalServerError, "list"))
 	}
 	return c.JSON(files)
@@ -223,7 +368,6 @@ func (h *FileHandler) GetRecentFiles(c *fiber.Ctx) error {
 	uid := middleware.UserIDFromToken(c)
 	files, err := h.repo.ListRecent(uid, 20)
 	if err != nil {
-		slog.Error("list recent", "user", uid, "err", err)
 		return utils.Respond(c, utils.NewError(fiber.StatusInternalServerError, "list recent"))
 	}
 	return c.JSON(files)
@@ -233,7 +377,6 @@ func (h *FileHandler) GetStarredFiles(c *fiber.Ctx) error {
 	uid := middleware.UserIDFromToken(c)
 	files, err := h.repo.ListStarred(uid)
 	if err != nil {
-		slog.Error("list starred", "user", uid, "err", err)
 		return utils.Respond(c, utils.NewError(fiber.StatusInternalServerError, "list starred"))
 	}
 	return c.JSON(files)
@@ -243,7 +386,6 @@ func (h *FileHandler) GetTrashedFiles(c *fiber.Ctx) error {
 	uid := middleware.UserIDFromToken(c)
 	files, err := h.repo.ListTrashed(uid)
 	if err != nil {
-		slog.Error("list trash", "user", uid, "err", err)
 		return utils.Respond(c, utils.NewError(fiber.StatusInternalServerError, "list trash"))
 	}
 	return c.JSON(files)
@@ -255,14 +397,12 @@ func (h *FileHandler) MoveFile(c *fiber.Ctx) error {
 	if err != nil {
 		return utils.Respond(c, utils.NewError(fiber.StatusBadRequest, "invalid id"))
 	}
-
 	var req struct {
 		FolderID *uint `json:"folder_id"`
 	}
 	if err := c.BodyParser(&req); err != nil {
 		return utils.Respond(c, utils.NewError(fiber.StatusBadRequest, "invalid body"))
 	}
-
 	file, err := h.repo.GetByID(id)
 	if err != nil {
 		return utils.Respond(c, utils.NewError(fiber.StatusNotFound, "file not found"))
@@ -270,14 +410,10 @@ func (h *FileHandler) MoveFile(c *fiber.Ctx) error {
 	if file.UserID != uid {
 		return utils.Respond(c, utils.NewError(fiber.StatusForbidden, "forbidden"))
 	}
-
 	if err := h.repo.UpdateFolderID(id, req.FolderID); err != nil {
-		slog.Error("move file", "id", id, "folder", req.FolderID, "err", err)
 		return utils.Respond(c, utils.NewError(fiber.StatusInternalServerError, "update failed"))
 	}
-
 	file.FolderID = req.FolderID
-	slog.Info("file moved", "id", id, "folder", req.FolderID, "user", uid)
 	return c.JSON(file)
 }
 
@@ -287,7 +423,6 @@ func (h *FileHandler) ToggleStar(c *fiber.Ctx) error {
 	if err != nil {
 		return utils.Respond(c, utils.NewError(fiber.StatusBadRequest, "invalid id"))
 	}
-
 	file, err := h.repo.GetByID(id)
 	if err != nil {
 		return utils.Respond(c, utils.NewError(fiber.StatusNotFound, "file not found"))
@@ -295,14 +430,10 @@ func (h *FileHandler) ToggleStar(c *fiber.Ctx) error {
 	if file.UserID != uid {
 		return utils.Respond(c, utils.NewError(fiber.StatusForbidden, "forbidden"))
 	}
-
 	file.Starred = !file.Starred
 	if err := h.repo.Update(file); err != nil {
-		slog.Error("toggle star", "id", id, "err", err)
 		return utils.Respond(c, utils.NewError(fiber.StatusInternalServerError, "update failed"))
 	}
-
-	slog.Info("file star toggled", "id", id, "starred", file.Starred)
 	return c.JSON(file)
 }
 
@@ -312,7 +443,6 @@ func (h *FileHandler) TrashFile(c *fiber.Ctx) error {
 	if err != nil {
 		return utils.Respond(c, utils.NewError(fiber.StatusBadRequest, "invalid id"))
 	}
-
 	file, err := h.repo.GetByID(id)
 	if err != nil {
 		return utils.Respond(c, utils.NewError(fiber.StatusNotFound, "file not found"))
@@ -320,13 +450,9 @@ func (h *FileHandler) TrashFile(c *fiber.Ctx) error {
 	if file.UserID != uid {
 		return utils.Respond(c, utils.NewError(fiber.StatusForbidden, "forbidden"))
 	}
-
 	if err := h.repo.UpdateTrashed(id, true); err != nil {
-		slog.Error("trash file", "id", id, "err", err)
 		return utils.Respond(c, utils.NewError(fiber.StatusInternalServerError, "update failed"))
 	}
-
-	slog.Info("file trashed", "id", id)
 	return c.SendStatus(fiber.StatusNoContent)
 }
 
@@ -336,7 +462,6 @@ func (h *FileHandler) RestoreFile(c *fiber.Ctx) error {
 	if err != nil {
 		return utils.Respond(c, utils.NewError(fiber.StatusBadRequest, "invalid id"))
 	}
-
 	file, err := h.repo.GetByID(id)
 	if err != nil {
 		return utils.Respond(c, utils.NewError(fiber.StatusNotFound, "file not found"))
@@ -344,14 +469,10 @@ func (h *FileHandler) RestoreFile(c *fiber.Ctx) error {
 	if file.UserID != uid {
 		return utils.Respond(c, utils.NewError(fiber.StatusForbidden, "forbidden"))
 	}
-
 	if err := h.repo.UpdateTrashed(id, false); err != nil {
-		slog.Error("restore file", "id", id, "err", err)
 		return utils.Respond(c, utils.NewError(fiber.StatusInternalServerError, "update failed"))
 	}
-
 	file.Trashed = false
-	slog.Info("file restored", "id", id)
 	return c.JSON(file)
 }
 
@@ -362,79 +483,43 @@ func (h *FileHandler) DeleteFile(c *fiber.Ctx) error {
 		return utils.Respond(c, utils.NewError(fiber.StatusBadRequest, "invalid id"))
 	}
 	if err := h.repo.Delete(id, uid); err != nil {
-		slog.Error("delete file", "id", id, "user", uid, "err", err)
 		return utils.Respond(c, utils.NewError(fiber.StatusInternalServerError, "delete"))
 	}
-	slog.Info("file deleted", "id", id, "user", uid)
 	return c.SendStatus(fiber.StatusNoContent)
 }
 
-func (h *FileHandler) HandleWebSocket(conn *websocket.Conn) {
-	id, err := parseUint(conn.Params("id"))
+// Stub methods to satisfy IFileHandler (WS-based upload replaces these)
+func (h *FileHandler) InitUpload(c *fiber.Ctx) error {
+	return c.Status(fiber.StatusGone).JSON(fiber.Map{"error": "use WebSocket upload"})
+}
+func (h *FileHandler) UploadChunk(c *fiber.Ctx) error {
+	return c.Status(fiber.StatusGone).JSON(fiber.Map{"error": "use WebSocket upload"})
+}
+func (h *FileHandler) CompleteUpload(c *fiber.Ctx) error {
+	return c.Status(fiber.StatusGone).JSON(fiber.Map{"error": "use WebSocket upload"})
+}
+func (h *FileHandler) VerifyChunks(c *fiber.Ctx) error {
+	id, err := parseUint(c.Params("id"))
 	if err != nil {
-		conn.Close()
-		return
+		return utils.Respond(c, utils.NewError(fiber.StatusBadRequest, "invalid id"))
 	}
-	h.wsMu.Lock()
-	if h.wsClients[id] == nil {
-		h.wsClients[id] = make(map[*websocket.Conn]bool)
+	idx, err := h.repo.GetVerifiedChunkIndices(id)
+	if err != nil {
+		return utils.Respond(c, utils.NewError(fiber.StatusInternalServerError, "verify"))
 	}
-	h.wsClients[id][conn] = true
-	h.wsMu.Unlock()
-	slog.Info("ws connected", "file", id)
-
-	defer func() {
-		h.wsMu.Lock()
-		delete(h.wsClients[id], conn)
-		h.wsMu.Unlock()
-		conn.Close()
-		slog.Info("ws disconnected", "file", id)
-	}()
-
-	for {
-		if _, _, err := conn.ReadMessage(); err != nil {
-			break
-		}
-	}
+	return c.JSON(fiber.Map{"uploaded_chunks": idx, "total": len(idx)})
 }
-
-func (h *FileHandler) broadcastProgress(fileID uint) {
-	h.wsMu.RLock()
-	clients := h.wsClients[fileID]
-	h.wsMu.RUnlock()
-
-	if len(clients) == 0 {
-		return
-	}
-
-	idx, _ := h.repo.GetVerifiedChunkIndices(fileID)
-	fu, _ := h.repo.GetByID(fileID)
-	pct := float64(0)
-	if fu != nil && fu.TotalChunks > 0 {
-		pct = float64(len(idx)) / float64(fu.TotalChunks) * 100
-	}
-
-	msg := fiber.Map{
-		"type":             "progress",
-		"file_upload_id":   fileID,
-		"uploaded_chunks":  len(idx),
-		"total_chunks":     fu.TotalChunks,
-		"progress_percent": pct,
-		"status":           fu.Status,
-		"file_name":        fu.FileName,
-	}
-
-	for cl := range clients {
-		if err := cl.WriteJSON(msg); err != nil {
-			cl.Close()
-			h.wsMu.Lock()
-			delete(h.wsClients[fileID], cl)
-			h.wsMu.Unlock()
-		}
-	}
-}
+func (h *FileHandler) HandleWebSocket(conn *websocket.Conn) { conn.Close() }
 
 func parseUint(s string) (uint, error) {
 	v, err := strconv.ParseUint(s, 10, 32)
 	return uint(v), err
+}
+
+// healthCheck used in main
+func HealthCheck(c *fiber.Ctx) error {
+	return c.JSON(fiber.Map{
+		"status": "ok",
+		"time":   time.Now().Unix(),
+	})
 }

@@ -19,7 +19,9 @@ func (r *FileRepository) Create(f *models.FileUpload) error {
 
 func (r *FileRepository) GetByID(id uint) (*models.FileUpload, error) {
 	var f models.FileUpload
-	err := r.db.Preload("Chunks").First(&f, id).Error
+	// No Preload("Chunks") — chunks are held in-memory during WS upload,
+	// not persisted to file_chunks anymore.
+	err := r.db.First(&f, id).Error
 	return &f, err
 }
 
@@ -36,13 +38,12 @@ func (r *FileRepository) UpdateTrashed(id uint, trashed bool) error {
 }
 
 func (r *FileRepository) Delete(id, userID uint) error {
-	// Must delete chunks first — file_chunks has a FK constraint on file_uploads.
-	// Deleting the parent without removing children violates the constraint.
 	if err := r.db.Exec("DELETE FROM file_chunks WHERE file_upload_id = ?", id).Error; err != nil {
 		return err
 	}
 	return r.db.Exec("DELETE FROM file_uploads WHERE id = ? AND user_id = ?", id, userID).Error
 }
+
 func (r *FileRepository) ListByFolder(userID uint, folderID *uint) ([]models.FileUpload, error) {
 	var files []models.FileUpload
 	q := r.db.Where("user_id = ? AND status = 'completed' AND trashed = false", userID)
@@ -80,6 +81,10 @@ func (r *FileRepository) ListTrashed(userID uint) ([]models.FileUpload, error) {
 	return files, err
 }
 
+// The following chunk methods are kept to satisfy the IFileRepository interface
+// and support the /upload/verify/:id endpoint. They are not used by the WS
+// upload path (which holds chunks in memory).
+
 func (r *FileRepository) CreateChunk(ch *models.FileChunk) error {
 	return r.db.Create(ch).Error
 }
@@ -107,7 +112,6 @@ func (r *FileRepository) GetVerifiedChunkIndices(fileID uint) ([]int, error) {
 	err := r.db.Select("chunk_index").
 		Where("file_upload_id = ? AND status = 'verified'", fileID).
 		Find(&chunks).Error
-
 	idx := make([]int, len(chunks))
 	for i, ch := range chunks {
 		idx[i] = ch.ChunkIndex

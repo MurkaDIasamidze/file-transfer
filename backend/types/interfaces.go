@@ -12,6 +12,8 @@ type IAuthHandler interface {
 	Register(c *fiber.Ctx) error
 	Login(c *fiber.Ctx) error
 	Me(c *fiber.Ctx) error
+	UpdateProfile(c *fiber.Ctx) error
+	ChangePassword(c *fiber.Ctx) error
 }
 
 type IFileHandler interface {
@@ -45,6 +47,7 @@ type IUserRepository interface {
 	Create(u *models.User) error
 	FindByEmail(email string) (*models.User, error)
 	FindByID(id uint) (*models.User, error)
+	Update(u *models.User) error
 }
 
 type IFileRepository interface {

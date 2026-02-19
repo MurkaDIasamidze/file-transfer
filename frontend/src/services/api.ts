@@ -1,7 +1,7 @@
 import axios from 'axios';
 import type { FileItem, Folder, User } from '../types';
 
-const BASE = import.meta.env.VITE_API_URL ?? 'http://localhost:8081';
+const BASE = (import.meta.env.VITE_API_URL ?? 'http://localhost:8081').replace(/\/$/, '');
 
 export const api = axios.create({ baseURL: BASE });
 
@@ -12,10 +12,11 @@ api.interceptors.request.use((cfg) => {
 });
 
 api.interceptors.response.use(
-  (r) => r,
-  (err) => {
+  r => r,
+  err => {
     if (err.response?.status === 401) {
       localStorage.removeItem('token');
+      localStorage.removeItem('user');
       window.location.href = '/login';
     }
     return Promise.reject(err);
@@ -29,6 +30,21 @@ export const authApi = {
 
   login: (email: string, password: string) =>
     api.post<{ token: string; user: User }>('/api/auth/login', { email, password }),
+
+  me: () =>
+    api.get<User>('/api/me'),
+};
+
+// ── Account ───────────────────────────────────────────────
+export const accountApi = {
+  updateProfile: (name: string) =>
+    api.patch<User>('/api/me', { name }),
+
+  changePassword: (currentPassword: string, newPassword: string) =>
+    api.post('/api/me/password', {
+      current_password: currentPassword,
+      new_password:     newPassword,
+    }),
 };
 
 // ── Folders ───────────────────────────────────────────────
@@ -84,26 +100,4 @@ export const filesApi = {
 
   delete: (id: number) =>
     api.delete(`/api/files/${id}`),
-
-  initUpload: (payload: {
-    file_name: string;
-    file_type: string;
-    file_size: number;
-    total_chunks: number;
-    checksum: string;
-    folder_id?: number | null;
-  }) => api.post<{ file_upload_id: number }>('/api/upload/init', payload),
-
-  uploadChunk: (form: FormData) =>
-    api.post('/api/upload/chunk', form, {
-      headers: { 'Content-Type': 'multipart/form-data' },
-    }),
-
-  complete: (fileUploadId: number) =>
-    api.post<{ file: FileItem }>('/api/upload/complete', {
-      file_upload_id: fileUploadId,
-    }),
-
-  verify: (id: number) =>
-    api.get<{ uploaded_chunks: number[]; total: number }>(`/api/upload/verify/${id}`),
 };

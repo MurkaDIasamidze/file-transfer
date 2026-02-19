@@ -11,11 +11,10 @@ type User struct {
 	Name      string         `gorm:"not null"             json:"name"`
 	Email     string         `gorm:"uniqueIndex;not null" json:"email"`
 	Password  string         `gorm:"not null"             json:"-"`
+	AvatarURL string         `gorm:"default:''"          json:"avatar_url"`
 	CreatedAt time.Time      `                            json:"created_at"`
 	UpdatedAt time.Time      `                            json:"updated_at"`
 	DeletedAt gorm.DeletedAt `gorm:"index"                json:"-"`
-	Folders   []Folder       `gorm:"foreignKey:UserID"    json:"folders,omitempty"`
-	Files     []FileUpload   `gorm:"foreignKey:UserID"    json:"files,omitempty"`
 }
 
 type Folder struct {
@@ -27,8 +26,6 @@ type Folder struct {
 	CreatedAt time.Time      `                           json:"created_at"`
 	UpdatedAt time.Time      `                           json:"updated_at"`
 	DeletedAt gorm.DeletedAt `gorm:"index"               json:"-"`
-	Children  []Folder       `gorm:"foreignKey:ParentID" json:"children,omitempty"`
-	Files     []FileUpload   `gorm:"foreignKey:FolderID" json:"files,omitempty"`
 }
 
 type FileUpload struct {
@@ -42,14 +39,15 @@ type FileUpload struct {
 	Checksum    string         `                               json:"checksum"`
 	Status      string         `gorm:"default:'pending'"       json:"status"`
 	FilePath    string         `                               json:"file_path"`
+	RelPath     string         `gorm:"default:''"             json:"rel_path"` // folder upload relative path
 	Starred     bool           `gorm:"default:false"           json:"starred"`
 	Trashed     bool           `gorm:"default:false"           json:"trashed"`
 	CreatedAt   time.Time      `                               json:"created_at"`
 	UpdatedAt   time.Time      `                               json:"updated_at"`
 	DeletedAt   gorm.DeletedAt `gorm:"index"                   json:"-"`
-	Chunks      []FileChunk    `gorm:"foreignKey:FileUploadID" json:"-"`
 }
 
+// FileChunk kept for backward compat / verify endpoint
 type FileChunk struct {
 	ID           uint           `gorm:"primarykey"        json:"id"`
 	FileUploadID uint           `gorm:"not null;index"    json:"file_upload_id"`

@@ -31,47 +31,43 @@ func main() {
 	db := database.New(&cfg.Database)
 	if err := db.Connect(); err != nil {
 		slog.Error("db connect", "err", err)
-
 		if os.Getenv("DROP_TABLES") == "true" {
-			slog.Warn("DROP_TABLES=true - attempting to drop and recreate tables")
+			slog.Warn("resetting database")
 			rawDB := db.GetDB()
-			tables := []string{"file_chunks", "file_uploads", "folders", "users"}
-			for _, t := range tables {
+			for _, t := range []string{"file_chunks", "file_uploads", "folders", "users"} {
 				rawDB.Exec("DROP TABLE IF EXISTS " + t + " CASCADE")
-				slog.Info("dropped table", "name", t)
 			}
 			db = database.New(&cfg.Database)
 			if err := db.Connect(); err != nil {
 				slog.Error("db reconnect failed", "err", err)
 				os.Exit(1)
 			}
-			slog.Info("database reset successful")
 		} else {
 			os.Exit(1)
 		}
 	}
 	defer db.Close()
 
-	// ── Directories ───────────────────────────────────────
 	if err := os.MkdirAll(cfg.Upload.Directory, os.ModePerm); err != nil {
 		slog.Error("mkdir uploads", "err", err)
 		os.Exit(1)
 	}
 
-	// ── Wire dependencies ─────────────────────────────────
+	// ── Wire ──────────────────────────────────────────────
 	gdb := db.GetDB()
 
-	userRepo := repository.NewUserRepository(gdb)
-	fileRepo := repository.NewFileRepository(gdb)
+	userRepo   := repository.NewUserRepository(gdb)
+	fileRepo   := repository.NewFileRepository(gdb)
 	folderRepo := repository.NewFolderRepository(gdb)
 
-	cs := services.NewChecksumService()
+	cs      := services.NewChecksumService()
 	fileSvc := services.NewFileService(cs)
 	authSvc := services.NewAuthService(userRepo, &cfg.JWT)
 
-	authHandler := handlers.NewAuthHandler(authSvc)
-	fileHandler := handlers.NewFileHandler(fileRepo, cs, fileSvc, &cfg.Upload)
-	folderHandler := handlers.NewFolderHandler(folderRepo)
+	authHandler     := handlers.NewAuthHandler(authSvc, userRepo)
+	fileHandler     := handlers.NewFileHandler(fileRepo, cs, fileSvc, &cfg.Upload)
+	folderHandler   := handlers.NewFolderHandler(folderRepo)
+	uploadWSHandler := handlers.NewUploadWSHandler(fileRepo, cs, fileSvc, &cfg.Upload)
 
 	// ── Fiber ─────────────────────────────────────────────
 	app := fiber.New(fiber.Config{
@@ -89,7 +85,7 @@ func main() {
 	}))
 	app.Use(middleware.Logger())
 
-	// WebSocket upgrade
+	// WebSocket upgrade middleware
 	app.Use("/ws", func(c *fiber.Ctx) error {
 		if websocket.IsWebSocketUpgrade(c) {
 			return c.Next()
@@ -97,44 +93,46 @@ func main() {
 		return fiber.ErrUpgradeRequired
 	})
 
-	// ── Routes ────────────────────────────────────────────
+	// ── Public routes ─────────────────────────────────────
+	app.Get("/health", handlers.HealthCheck)
+
 	auth := app.Group("/api/auth")
 	auth.Post("/register", authHandler.Register)
-	auth.Post("/login", authHandler.Login)
+	auth.Post("/login",    authHandler.Login)
 
+	// ── Protected REST routes ─────────────────────────────
 	api := app.Group("/api", middleware.JWTMiddleware(&cfg.JWT))
-	api.Get("/me", authHandler.Me)
+	api.Get("/me",           authHandler.Me)
+	api.Patch("/me",         authHandler.UpdateProfile)
+	api.Post("/me/password", authHandler.ChangePassword)
 
-	// Upload
-	api.Post("/upload/init", fileHandler.InitUpload)
-	api.Post("/upload/chunk", fileHandler.UploadChunk)
-	api.Post("/upload/complete", fileHandler.CompleteUpload)
-	api.Get("/upload/verify/:id", fileHandler.VerifyChunks)
-
-	// Files — static routes MUST come before /:id param routes
-	api.Get("/files", fileHandler.ListFiles)
-	api.Get("/files/recent", fileHandler.GetRecentFiles)
-	api.Get("/files/starred", fileHandler.GetStarredFiles)
-	api.Get("/files/trash", fileHandler.GetTrashedFiles)
-	api.Patch("/files/:id/move", fileHandler.MoveFile)       // was Put
-	api.Patch("/files/:id/star", fileHandler.ToggleStar)     // was Put
-	api.Patch("/files/:id/trash", fileHandler.TrashFile)     // was Put
-	api.Patch("/files/:id/restore", fileHandler.RestoreFile) // was Put
-	api.Delete("/files/:id", fileHandler.DeleteFile)
+	// Files
+	api.Get("/files",               fileHandler.ListFiles)
+	api.Get("/files/recent",        fileHandler.GetRecentFiles)
+	api.Get("/files/starred",       fileHandler.GetStarredFiles)
+	api.Get("/files/trash",         fileHandler.GetTrashedFiles)
+	api.Patch("/files/:id/move",    fileHandler.MoveFile)
+	api.Patch("/files/:id/star",    fileHandler.ToggleStar)
+	api.Patch("/files/:id/trash",   fileHandler.TrashFile)
+	api.Patch("/files/:id/restore", fileHandler.RestoreFile)
+	api.Delete("/files/:id",        fileHandler.DeleteFile)
 
 	// Folders
-	// Folders
-	api.Post("/folders", folderHandler.CreateFolder)
-	api.Get("/folders", folderHandler.ListFolders)
-	api.Get("/folders/trash", folderHandler.GetTrashedFolders)
-	api.Patch("/folders/:id/trash", folderHandler.TrashFolder)
-	api.Patch("/folders/:id/restore", folderHandler.RestoreFolder)
-	api.Delete("/folders/:id", folderHandler.DeleteFolder)
-	app.Get("/ws/upload/:id", websocket.New(func(c *websocket.Conn) {
-		fileHandler.HandleWebSocket(c)
+	api.Post("/folders",                 folderHandler.CreateFolder)
+	api.Get("/folders",                  folderHandler.ListFolders)
+	api.Get("/folders/trash",            folderHandler.GetTrashedFolders)
+	api.Patch("/folders/:id/trash",      folderHandler.TrashFolder)
+	api.Patch("/folders/:id/restore",    folderHandler.RestoreFolder)
+	api.Delete("/folders/:id",           folderHandler.DeleteFolder)
+
+	// ── WebSocket upload ──────────────────────────────────
+	// Token is validated by a lightweight WS-aware JWT check before upgrade.
+	// We store the fiber.Ctx in Locals so the handler can call UserIDFromToken.
+	app.Get("/ws/upload", middleware.WSJWTMiddleware(&cfg.JWT), websocket.New(func(c *websocket.Conn) {
+		// Pass ctx via locals set by WSJWTMiddleware
+		uploadWSHandler.HandleUpload(c)
 	}))
 
-	// ── Start ─────────────────────────────────────────────
 	slog.Info("server starting", "port", cfg.Server.Port)
 	if err := app.Listen(":" + cfg.Server.Port); err != nil {
 		slog.Error("listen", "err", err)

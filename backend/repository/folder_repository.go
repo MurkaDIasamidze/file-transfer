@@ -50,9 +50,30 @@ func (r *FolderRepository) UpdateTrashed(id, userID uint, trashed bool) error {
 	).Error
 }
 
+// Delete permanently removes a folder and all files inside it.
+// The FK constraint "fk_folders_files" on file_uploads.folder_id requires we
+// delete (or nullify) child file_uploads rows before deleting the folder row.
 func (r *FolderRepository) Delete(id, userID uint) error {
-	return r.db.Exec(
-		"DELETE FROM folders WHERE id = ? AND user_id = ?",
-		id, userID,
-	).Error
+	return r.db.Transaction(func(tx *gorm.DB) error {
+		// 1. Delete chunks that belong to files in this folder
+		if err := tx.Exec(`
+			DELETE FROM file_chunks
+			WHERE file_upload_id IN (
+				SELECT id FROM file_uploads WHERE folder_id = ?
+			)`, id).Error; err != nil {
+			return err
+		}
+
+		// 2. Delete files inside the folder
+		if err := tx.Exec(
+			"DELETE FROM file_uploads WHERE folder_id = ?", id,
+		).Error; err != nil {
+			return err
+		}
+
+		// 3. Delete the folder itself (owned by this user)
+		return tx.Exec(
+			"DELETE FROM folders WHERE id = ? AND user_id = ?", id, userID,
+		).Error
+	})
 }
