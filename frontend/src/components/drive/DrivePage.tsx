@@ -2,6 +2,7 @@ import { useEffect, useState, useCallback, useMemo } from 'react';
 import { filesApi, foldersApi } from '../../services/api';
 import type { FileItem, Folder, BreadcrumbItem } from '../../types';
 import type { UploadProgress } from '../../services/uploadService';
+import type { SelectionKey } from './FileGrid';
 import Header from './Header';
 import Sidebar from './Sidebar';
 import FileGrid from './FileGrid';
@@ -22,38 +23,55 @@ export default function DrivePage() {
   const [uploads,     setUploads]     = useState<Map<number, UploadProgress>>(new Map());
   const [search,      setSearch]      = useState('');
 
+  // ── Selection ──────────────────────────────────────────────────────────────
+  // Key format: "file-{id}" | "folder-{id}"
+  const [selected, setSelected] = useState<Set<SelectionKey>>(new Set());
+
+  // Every click simply toggles that item independently — no shift required.
+  const handleSelect = useCallback((key: SelectionKey) => {
+    setSelected(prev => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }, []);
+
+  const clearSelection = useCallback(() => setSelected(new Set()), []);
+
+  // Clear selection when view changes
+  useEffect(() => { clearSelection(); }, [viewMode, currentId, clearSelection]);
+
+  // ── Data loading ───────────────────────────────────────────────────────────
   const load = useCallback(async (folderId: number | null, mode: ViewMode) => {
     setLoading(true);
     try {
       if (mode === 'recent') {
         const { data } = await filesApi.recent();
-        setFiles(data);
-        setFolders([]);
+        setFiles(data); setFolders([]);
       } else if (mode === 'starred') {
         const { data } = await filesApi.starred();
-        setFiles(data);
-        setFolders([]);
+        setFiles(data); setFolders([]);
       } else if (mode === 'trash') {
         const [fRes, fiRes] = await Promise.all([foldersApi.listTrashed(), filesApi.trash()]);
-        setFolders(fRes.data);
-        setFiles(fiRes.data);
+        setFolders(fRes.data); setFiles(fiRes.data);
       } else {
         const [fRes, fiRes] = await Promise.all([
           foldersApi.list(folderId),
           filesApi.list(folderId),
         ]);
-        setFolders(fRes.data);
-        setFiles(fiRes.data);
+        setFolders(fRes.data); setFiles(fiRes.data);
       }
     } finally {
       setLoading(false);
     }
   }, []);
 
-  useEffect(() => {
-    load(currentId, viewMode);
-  }, [currentId, viewMode, load]);
+  useEffect(() => { load(currentId, viewMode); }, [currentId, viewMode, load]);
 
+  const refresh = useCallback(() => load(currentId, viewMode), [load, currentId, viewMode]);
+
+  // ── Filtered lists ─────────────────────────────────────────────────────────
   const filteredFolders = useMemo(() =>
     !search.trim() ? folders : folders.filter(f => f.name.toLowerCase().includes(search.toLowerCase())),
   [folders, search]);
@@ -62,6 +80,7 @@ export default function DrivePage() {
     !search.trim() ? files : files.filter(f => f.file_name.toLowerCase().includes(search.toLowerCase())),
   [files, search]);
 
+  // ── Navigation ─────────────────────────────────────────────────────────────
   const openFolder = (f: Folder) => {
     setViewMode('my-drive');
     setCurrentId(f.id);
@@ -87,29 +106,64 @@ export default function DrivePage() {
     }]);
   };
 
-  // ── File actions ──────────────────────────────────────────────────────────
-  const refresh = useCallback(() => load(currentId, viewMode), [load, currentId, viewMode]);
-
+  // ── Individual file/folder actions ─────────────────────────────────────────
   const handleTrashFolder   = async (id: number) => { await foldersApi.trash(id);   refresh(); };
   const handleRestoreFolder = async (id: number) => { await foldersApi.restore(id); refresh(); };
   const handleDeleteFolder  = async (id: number) => { await foldersApi.delete(id);  refresh(); };
-  const handleMoveFile      = async (fileId: number, folderId: number | null) => { await filesApi.move(fileId, folderId); refresh(); };
-  const handleToggleStar    = async (id: number) => { await filesApi.toggleStar(id);    refresh(); };
-  const handleTrashFile     = async (id: number) => { await filesApi.moveToTrash(id);   refresh(); };
-  const handleRestoreFile   = async (id: number) => { await filesApi.restore(id);       refresh(); };
-  const handleDeleteFile    = async (id: number) => { await filesApi.delete(id);        refresh(); };
+  const handleMoveFile      = async (fileId: number, folderId: number | null) => {
+    await filesApi.move(fileId, folderId); refresh();
+  };
+  const handleToggleStar  = async (id: number) => { await filesApi.toggleStar(id);  refresh(); };
+  const handleTrashFile   = async (id: number) => { await filesApi.moveToTrash(id); refresh(); };
+  const handleRestoreFile = async (id: number) => { await filesApi.restore(id);     refresh(); };
+  const handleDeleteFile  = async (id: number) => { await filesApi.delete(id);      refresh(); };
 
-  // ── Upload progress ───────────────────────────────────────────────────────
+  // ── Bulk actions ───────────────────────────────────────────────────────────
+  const selectedFileIds   = [...selected].filter(k => k.startsWith('file-')).map(k => parseInt(k.slice(5)));
+  const selectedFolderIds = [...selected].filter(k => k.startsWith('folder-')).map(k => parseInt(k.slice(7)));
+
+  const handleBulkTrash = useCallback(async () => {
+    await Promise.all([
+      ...selectedFileIds.map(id   => filesApi.moveToTrash(id)),
+      ...selectedFolderIds.map(id => foldersApi.trash(id)),
+    ]);
+    clearSelection();
+    refresh();
+  }, [selectedFileIds, selectedFolderIds, clearSelection, refresh]);
+
+  const handleBulkRestore = useCallback(async () => {
+    await Promise.all([
+      ...selectedFileIds.map(id   => filesApi.restore(id)),
+      ...selectedFolderIds.map(id => foldersApi.restore(id)),
+    ]);
+    clearSelection();
+    refresh();
+  }, [selectedFileIds, selectedFolderIds, clearSelection, refresh]);
+
+  const handleBulkDelete = useCallback(async () => {
+    await Promise.all([
+      ...selectedFileIds.map(id   => filesApi.delete(id)),
+      ...selectedFolderIds.map(id => foldersApi.delete(id)),
+    ]);
+    clearSelection();
+    refresh();
+  }, [selectedFileIds, selectedFolderIds, clearSelection, refresh]);
+
+  const handleBulkStar = useCallback(async () => {
+    await Promise.all(selectedFileIds.map(id => filesApi.toggleStar(id)));
+    clearSelection();
+    refresh();
+  }, [selectedFileIds, clearSelection, refresh]);
+
+  // ── Upload ─────────────────────────────────────────────────────────────────
   const onUploadProgress = (p: UploadProgress) => {
     setUploads(prev => new Map(prev).set(p.fileUploadId, p));
   };
 
-  // Called after EACH individual file completes — drives real-time list update
   const onFileComplete = useCallback(() => {
     load(currentId, viewMode);
   }, [load, currentId, viewMode]);
 
-  // Auto-clear completed uploads from the progress bar after 3 s
   useEffect(() => {
     const allDone = uploads.size > 0 && [...uploads.values()].every(u => u.status === 'completed');
     if (!allDone) return;
@@ -117,6 +171,7 @@ export default function DrivePage() {
     return () => clearTimeout(t);
   }, [uploads]);
 
+  // ── Render ─────────────────────────────────────────────────────────────────
   return (
     <div className="flex h-screen bg-gray-50 overflow-hidden">
       <Sidebar
@@ -127,9 +182,10 @@ export default function DrivePage() {
       />
 
       <div className="flex flex-col flex-1 overflow-hidden">
-        <Header onSearch={setSearch} />
+        <Header onSearch={setSearch}/>
 
         <main className="flex-1 overflow-auto p-6">
+
           {/* Breadcrumb */}
           {viewMode === 'my-drive' && (
             <nav className="flex items-center gap-1 text-sm mb-6 text-gray-500">
@@ -210,6 +266,9 @@ export default function DrivePage() {
               folders={filteredFolders}
               files={filteredFiles}
               viewMode={viewMode}
+              selected={selected}
+              onSelect={handleSelect}
+              onClearSelection={clearSelection}
               onOpenFolder={openFolder}
               onTrashFolder={handleTrashFolder}
               onRestoreFolder={handleRestoreFolder}
@@ -219,6 +278,10 @@ export default function DrivePage() {
               onTrashFile={handleTrashFile}
               onRestoreFile={handleRestoreFile}
               onDeleteFile={handleDeleteFile}
+              onBulkTrash={handleBulkTrash}
+              onBulkRestore={handleBulkRestore}
+              onBulkDelete={handleBulkDelete}
+              onBulkStar={handleBulkStar}
             />
           )}
         </main>
