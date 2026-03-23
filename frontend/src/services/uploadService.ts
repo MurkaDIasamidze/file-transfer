@@ -1,5 +1,3 @@
-// uploadService.ts — WebSocket-based chunked upload
-
 const WS_BASE    = (import.meta.env.VITE_WS_URL ?? 'ws://localhost:8081').replace(/\/$/, '');
 const CHUNK_SIZE = parseInt(import.meta.env.VITE_CHUNK_SIZE ?? '262144', 10); // 256 KB
 

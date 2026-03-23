@@ -1,10 +1,10 @@
-// main.go — точка входа, собирает все зависимости вместе
 package main
 
 import (
 	"file-transfer-backend/config"
 	"file-transfer-backend/database"
 	"file-transfer-backend/handlers"
+	"file-transfer-backend/logger"
 	"file-transfer-backend/middleware"
 	"file-transfer-backend/repository"
 	"file-transfer-backend/services"
@@ -18,30 +18,33 @@ import (
 )
 
 func main() {
-	// 1. Загружаем .env файл
+	// 1. Load .env
 	godotenv.Load()
 
-	// 2. Читаем конфиг из переменных окружения
+	// 2. Set up logger — colored terminal + JSON file
+	//    Logs are written to logs/app.json (created automatically)
+	slog.SetDefault(logger.New("logs/app.json"))
+
+	// 3. Read config
 	cfg := config.LoadConfig()
 
-	// 3. Подключаемся к PostgreSQL и мигрируем схему
+	// 4. Connect to PostgreSQL
 	db := database.New(&cfg.Database)
 	if err := db.Connect(); err != nil {
 		log.Fatalf("database connect: %v", err)
 	}
 	gdb := db.GetDB()
 
-	// 4. Создаём репозитории (работа с таблицами БД)
+	// 5. Repositories
 	userRepo   := repository.NewUserRepository(gdb)
 	fileRepo   := repository.NewFileRepository(gdb)
 	folderRepo := repository.NewFolderRepository(gdb)
 
-	// 5. Создаём сервисы (бизнес-логика)
+	// 6. Services
 	authSvc := services.NewAuthService(userRepo, &cfg.JWT)
 	cs      := services.NewChecksumService()
 
-	// 6. Инициализируем S3 если ключи заданы в .env
-	//    Если S3 не настроен — s3Svc будет nil и файлы сохранятся локально.
+	// 7. S3 (optional — enabled only when keys are present in .env)
 	var s3Svc *services.S3Service
 	if cfg.S3.Enabled {
 		var err error
@@ -52,20 +55,25 @@ func main() {
 			cfg.S3.Bucket,
 		)
 		if err != nil {
-			log.Fatalf("S3 init failed: %v\nПроверь AWS_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_S3_BUCKET в .env", err)
+			log.Fatalf("S3 init failed: %v", err)
 		}
-		slog.Info("S3 storage enabled", "bucket", cfg.S3.Bucket, "region", cfg.S3.Region)
+		slog.Info("S3 async upload enabled",
+			"bucket", cfg.S3.Bucket,
+			"region", cfg.S3.Region,
+		)
 	} else {
-		slog.Info("S3 not configured — using local storage", "dir", cfg.Upload.Directory)
+		slog.Info("S3 not configured — using local storage",
+			"dir", cfg.Upload.Directory,
+		)
 	}
 
-	// 7. Создаём HTTP хендлеры (передаём s3Svc — может быть nil)
+	// 8. Handlers
 	authHandler   := handlers.NewAuthHandler(authSvc, userRepo)
 	fileHandler   := handlers.NewFileHandler(fileRepo, &cfg.Upload, s3Svc)
 	folderHandler := handlers.NewFolderHandler(folderRepo)
 	uploadHandler := handlers.NewUploadWSHandler(fileRepo, cs, &cfg.Upload, s3Svc)
 
-	// 8. Создаём Fiber приложение
+	// 9. Fiber app
 	app := fiber.New(fiber.Config{
 		BodyLimit: cfg.Server.MaxBodySize,
 	})
@@ -76,42 +84,42 @@ func main() {
 		AllowMethods: "GET, POST, PATCH, DELETE",
 	}))
 
-	// 9. Публичные маршруты (без JWT)
+	// 10. Public routes
 	app.Get("/health", handlers.HealthCheck)
 	auth := app.Group("/api/auth")
 	auth.Post("/register", authHandler.Register)
 	auth.Post("/login",    authHandler.Login)
 
-	// 10. Защищённые маршруты (требуют JWT токен)
+	// 11. Protected routes
 	api := app.Group("/api", middleware.JWTMiddleware(&cfg.JWT))
 
 	api.Get("/me",           authHandler.Me)
 	api.Patch("/me",         authHandler.UpdateProfile)
 	api.Post("/me/password", authHandler.ChangePassword)
 
-	api.Get("/files",                  fileHandler.ListFiles)
-	api.Get("/files/recent",           fileHandler.GetRecentFiles)
-	api.Get("/files/starred",          fileHandler.GetStarredFiles)
-	api.Get("/files/trash",            fileHandler.GetTrashedFiles)
-	api.Get("/files/:id/download",     fileHandler.DownloadFile)   // ← новый эндпоинт
-	api.Patch("/files/:id/move",       fileHandler.MoveFile)
-	api.Patch("/files/:id/star",       fileHandler.ToggleStar)
-	api.Patch("/files/:id/trash",      fileHandler.TrashFile)
-	api.Patch("/files/:id/restore",    fileHandler.RestoreFile)
-	api.Delete("/files/:id",           fileHandler.DeleteFile)
+	api.Get("/files",                fileHandler.ListFiles)
+	api.Get("/files/recent",         fileHandler.GetRecentFiles)
+	api.Get("/files/starred",        fileHandler.GetStarredFiles)
+	api.Get("/files/trash",          fileHandler.GetTrashedFiles)
+	api.Get("/files/:id/download",   fileHandler.DownloadFile)
+	api.Patch("/files/:id/move",     fileHandler.MoveFile)
+	api.Patch("/files/:id/star",     fileHandler.ToggleStar)
+	api.Patch("/files/:id/trash",    fileHandler.TrashFile)
+	api.Patch("/files/:id/restore",  fileHandler.RestoreFile)
+	api.Delete("/files/:id",         fileHandler.DeleteFile)
 
-	api.Get("/folders",                folderHandler.ListFolders)
-	api.Post("/folders",               folderHandler.CreateFolder)
-	api.Get("/folders/trash",          folderHandler.GetTrashedFolders)
-	api.Patch("/folders/:id/trash",    folderHandler.TrashFolder)
-	api.Patch("/folders/:id/restore",  folderHandler.RestoreFolder)
-	api.Delete("/folders/:id",         folderHandler.DeleteFolder)
+	api.Get("/folders",               folderHandler.ListFolders)
+	api.Post("/folders",              folderHandler.CreateFolder)
+	api.Get("/folders/trash",         folderHandler.GetTrashedFolders)
+	api.Patch("/folders/:id/trash",   folderHandler.TrashFolder)
+	api.Patch("/folders/:id/restore", folderHandler.RestoreFolder)
+	api.Delete("/folders/:id",        folderHandler.DeleteFolder)
 
-	// 11. WebSocket загрузка файлов
+	// 12. WebSocket upload
 	app.Use("/ws/upload", middleware.WSJWTMiddleware(&cfg.JWT))
 	app.Get("/ws/upload", websocket.New(uploadHandler.HandleUpload))
 
-	// 12. Запускаем сервер
+	// 13. Start
 	slog.Info("server starting", "port", cfg.Server.Port)
 	if err := app.Listen(":" + cfg.Server.Port); err != nil {
 		log.Fatalf("server error: %v", err)

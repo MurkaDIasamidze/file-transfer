@@ -25,7 +25,8 @@ export default function AccountPage({ onClose }: Props) {
     setSaving(true);
     try {
       const { data } = await api.patch('/api/me', { name: name.trim() });
-      setAuth(data, token!);
+      // setAuth(token, user) — token first, user second
+      setAuth(token!, data);
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
     } catch {
@@ -138,14 +139,14 @@ export default function AccountPage({ onClose }: Props) {
 
           {tab === 'security' && (
             <>
-              {['current', 'next', 'confirm'].map((key) => (
+              {(['current', 'next', 'confirm'] as const).map((key) => (
                 <div key={key}>
-                  <label className="block text-sm font-medium text-gray-700 mb-1.5 capitalize">
+                  <label className="block text-sm font-medium text-gray-700 mb-1.5">
                     {key === 'next' ? 'New password' : key === 'confirm' ? 'Confirm new password' : 'Current password'}
                   </label>
                   <input
                     type="password"
-                    value={pwdForm[key as keyof typeof pwdForm]}
+                    value={pwdForm[key]}
                     onChange={e => setPwdForm(p => ({ ...p, [key]: e.target.value }))}
                     className="w-full px-4 py-2.5 border border-gray-200 rounded-xl text-sm bg-gray-50 focus:bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all"
                     placeholder="••••••••"

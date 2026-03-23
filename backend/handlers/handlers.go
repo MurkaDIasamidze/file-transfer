@@ -67,14 +67,14 @@ type UploadWSHandler struct {
 	repo types.IFileRepository
 	cs   types.IChecksumService
 	cfg  *config.UploadConfig
-	s3   *services.S3Service // nil = локальное хранилище
+	s3   *services.S3Service // nil = local storage
 }
 
 func NewUploadWSHandler(
 	repo types.IFileRepository,
 	cs   types.IChecksumService,
 	cfg  *config.UploadConfig,
-	s3   *services.S3Service, // передай nil если S3 не настроен
+	s3   *services.S3Service,
 ) *UploadWSHandler {
 	return &UploadWSHandler{repo: repo, cs: cs, cfg: cfg, s3: s3}
 }
@@ -83,7 +83,7 @@ func (h *UploadWSHandler) HandleUpload(conn *websocket.Conn) {
 	uid := middleware.WSUserID(conn.Locals)
 	defer conn.Close()
 
-	chunks := map[uint]map[int][]byte{} // fileID → chunkIdx → bytes
+	chunks := map[uint]map[int][]byte{}
 	totals := map[uint]int{}
 
 	for {
@@ -106,15 +106,33 @@ func (h *UploadWSHandler) HandleUpload(conn *websocket.Conn) {
 
 func (h *UploadWSHandler) wsInit(conn *websocket.Conn, uid uint, data json.RawMessage, chunks map[uint]map[int][]byte) {
 	var req initMsg
-	if err := json.Unmarshal(data, &req); err != nil { wsError(conn, "bad init"); return }
+	if err := json.Unmarshal(data, &req); err != nil {
+		slog.Error("wsInit: bad JSON", "err", err)
+		wsError(conn, "bad init"); return
+	}
 
 	fu := &models.FileUpload{
-		UserID: uid, FolderID: req.FolderID,
-		FileName: req.FileName, FileType: req.FileType,
-		FileSize: req.FileSize, Checksum: req.Checksum,
-		Status: "pending", RelPath: req.RelPath,
+		UserID:   uid,
+		FolderID: req.FolderID,
+		FileName: req.FileName,
+		FileType: req.FileType,
+		FileSize: req.FileSize,
+		Checksum: req.Checksum,
+		Status:   "pending",
+		RelPath:  req.RelPath,
 	}
-	if err := h.repo.Create(fu); err != nil { wsError(conn, "init failed"); return }
+	if err := h.repo.Create(fu); err != nil {
+		slog.Error("wsInit: db create failed", "err", err, "user", uid)
+		wsError(conn, "init failed"); return
+	}
+
+	// ✅ LOG: upload started
+	slog.Info("⬆  upload started",
+		"file_id",   fu.ID,
+		"file_name", fu.FileName,
+		"file_size", fu.FileSize,
+		"user",      uid,
+	)
 
 	chunks[fu.ID] = map[int][]byte{}
 	conn.WriteJSON(map[string]any{"type": "init_ack", "file_upload_id": fu.ID, "file_name": fu.FileName})
@@ -122,118 +140,212 @@ func (h *UploadWSHandler) wsInit(conn *websocket.Conn, uid uint, data json.RawMe
 
 func (h *UploadWSHandler) wsChunk(conn *websocket.Conn, data json.RawMessage, chunks map[uint]map[int][]byte, totals map[uint]int) {
 	var req chunkMsg
-	if err := json.Unmarshal(data, &req); err != nil { wsError(conn, "bad chunk"); return }
+	if err := json.Unmarshal(data, &req); err != nil {
+		slog.Error("wsChunk: bad JSON", "err", err)
+		wsError(conn, "bad chunk"); return
+	}
 
 	raw, err := base64.StdEncoding.DecodeString(req.Data)
-	if err != nil { wsError(conn, "bad base64"); return }
+	if err != nil {
+		slog.Error("wsChunk: base64 decode failed", "file_id", req.FileUploadID, "chunk", req.ChunkIndex, "err", err)
+		wsError(conn, "bad base64"); return
+	}
 
 	if sum := sha256hex(raw); sum != req.Checksum {
+		slog.Warn("wsChunk: checksum mismatch", "file_id", req.FileUploadID, "chunk", req.ChunkIndex)
 		wsError(conn, fmt.Sprintf("checksum mismatch chunk %d", req.ChunkIndex)); return
 	}
 
 	fc, ok := chunks[req.FileUploadID]
-	if !ok { wsError(conn, "unknown file_upload_id"); return }
+	if !ok {
+		slog.Error("wsChunk: unknown file_upload_id", "file_id", req.FileUploadID)
+		wsError(conn, "unknown file_upload_id"); return
+	}
 
 	fc[req.ChunkIndex] = raw
 	totals[req.FileUploadID] = req.TotalChunks
 
 	if len(fc) == 1 {
 		if fu, err := h.repo.GetByID(req.FileUploadID); err == nil {
-			fu.Status = "uploading"
+			fu.Status      = "uploading"
 			fu.TotalChunks = req.TotalChunks
 			h.repo.Update(fu)
 		}
 	}
 
 	conn.WriteJSON(progressMsg{
-		Type: "progress", FileUploadID: req.FileUploadID,
-		Uploaded: len(fc), Total: req.TotalChunks,
-		Percent: float64(len(fc)) / float64(req.TotalChunks) * 100, Status: "uploading",
+		Type:         "progress",
+		FileUploadID: req.FileUploadID,
+		Uploaded:     len(fc),
+		Total:        req.TotalChunks,
+		Percent:      float64(len(fc)) / float64(req.TotalChunks) * 100,
+		Status:       "uploading",
 	})
 }
 
 func (h *UploadWSHandler) wsComplete(conn *websocket.Conn, uid uint, data json.RawMessage, chunks map[uint]map[int][]byte, totals map[uint]int) {
 	var req completeMsg
-	if err := json.Unmarshal(data, &req); err != nil { wsError(conn, "bad complete"); return }
+	if err := json.Unmarshal(data, &req); err != nil {
+		slog.Error("wsComplete: bad JSON", "err", err)
+		wsError(conn, "bad complete"); return
+	}
 
 	fu, err := h.repo.GetByID(req.FileUploadID)
-	if err != nil || fu.UserID != uid { wsError(conn, "not found or forbidden"); return }
+	if err != nil || fu.UserID != uid {
+		slog.Error("wsComplete: not found or forbidden", "file_id", req.FileUploadID, "user", uid)
+		wsError(conn, "not found or forbidden"); return
+	}
 
 	fc, ok := chunks[req.FileUploadID]
-	if !ok || len(fc) == 0 { wsError(conn, "no chunks"); return }
+	if !ok || len(fc) == 0 {
+		slog.Error("wsComplete: no chunks in memory", "file_id", req.FileUploadID)
+		wsError(conn, "no chunks"); return
+	}
 
 	total := totals[req.FileUploadID]
 	if total == 0 { total = len(fc) }
 
-	// ── Склеиваем куски в один буфер ─────────────────────────────────────────
+	// Assemble chunks into a single byte slice
 	var buf bytes.Buffer
 	for i := range total {
 		chunk, ok := fc[i]
-		if !ok { wsError(conn, fmt.Sprintf("missing chunk %d", i)); return }
+		if !ok {
+			slog.Error("wsComplete: missing chunk", "file_id", req.FileUploadID, "chunk", i)
+			wsError(conn, fmt.Sprintf("missing chunk %d", i)); return
+		}
 		buf.Write(chunk)
 	}
 	fileBytes := buf.Bytes()
 
-	// ── Проверяем контрольную сумму всего файла ───────────────────────────────
+	// Verify whole-file checksum
 	if sha256hex(fileBytes) != fu.Checksum {
-		fu.Status = "failed"; h.repo.Update(fu)
+		fu.Status = "failed"
+		h.repo.Update(fu)
+		slog.Error("wsComplete: file checksum mismatch", "file_id", fu.ID, "file_name", fu.FileName)
 		wsError(conn, "file checksum mismatch"); return
 	}
 
-	// ── Определяем куда сохранять: S3 или локально ───────────────────────────
+	// Free chunk memory immediately — no longer needed
+	delete(chunks, req.FileUploadID)
+
 	if h.s3 != nil {
-		// ── S3 путь ───────────────────────────────────────────────────────────
+		// ── ASYNC S3 upload ───────────────────────────────────────────────────
 		//
-		// Строим ключ S3: "users/42/folders/7/docs/report.pdf"
-		var folderID uint
-		if fu.FolderID != nil { folderID = *fu.FolderID }
+		// We mark the file "processing" and reply done to the client RIGHT NOW.
+		// The actual S3 PutObject runs in a goroutine. The user's browser
+		// immediately shows the file as "processing" in the UI; once the goroutine
+		// finishes, the DB row is updated to "completed" and the next file-list
+		// poll will show it normally.
+		//
+		// This means large files (100+ MB) don't block the WebSocket connection.
 
-		relPath := fu.RelPath
-		if relPath == "" { relPath = fu.FileName }
+		fu.Status = "processing"
+		h.repo.Update(fu)
 
-		s3Key := services.BuildKey(uid, folderID, relPath)
+		// Reply to client immediately — they don't wait for S3
+		conn.WriteJSON(map[string]any{"type": "done", "file": fu})
 
-		// Загружаем файл в S3
-		if _, err := h.s3.Upload(context.Background(), s3Key, fileBytes, fu.FileType); err != nil {
-			fu.Status = "failed"; h.repo.Update(fu)
-			wsError(conn, "s3 upload failed: "+err.Error()); return
-		}
+		slog.Info("⏳ queued for S3 upload",
+			"file_id",   fu.ID,
+			"file_name", fu.FileName,
+			"file_size", len(fileBytes),
+		)
 
-		// Сохраняем S3 ключ вместо локального пути
-		fu.Status   = "completed"
-		fu.FilePath = s3Key // теперь FilePath хранит S3 ключ, не путь на диске
-		slog.Info("uploaded to S3", "key", s3Key, "file", fu.ID)
+		// Capture everything needed by the goroutine — do NOT pass conn or fc
+		fuID      := fu.ID
+		fuName    := fu.FileName
+		fuType    := fu.FileType
+		fuRelPath := fu.RelPath
+		fuFolderID := fu.FolderID
+		repo      := h.repo
+		s3svc     := h.s3
+
+		go func() {
+			start := time.Now()
+
+			var folderID uint
+			if fuFolderID != nil { folderID = *fuFolderID }
+
+			relPath := fuRelPath
+			if relPath == "" { relPath = fuName }
+
+			s3Key := services.BuildKey(uid, folderID, relPath)
+
+			if _, err := s3svc.Upload(context.Background(), s3Key, fileBytes, fuType); err != nil {
+				slog.Error("✗  S3 upload failed",
+					"file_id",   fuID,
+					"file_name", fuName,
+					"key",       s3Key,
+					"err",       err,
+					"elapsed",   time.Since(start).Round(time.Millisecond),
+				)
+				// Mark as failed in DB so the UI can show error state
+				if record, dbErr := repo.GetByID(fuID); dbErr == nil {
+					record.Status = "failed"
+					repo.Update(record)
+				}
+				return
+			}
+
+			// Update DB: completed + store S3 key as FilePath
+			record, dbErr := repo.GetByID(fuID)
+			if dbErr != nil {
+				slog.Error("✗  S3 post-upload: db fetch failed", "file_id", fuID, "err", dbErr)
+				return
+			}
+			record.Status   = "completed"
+			record.FilePath = s3Key
+			repo.Update(record)
+
+			// ✅ LOG: upload finished
+			slog.Info("✓  upload complete (S3)",
+				"file_id",   fuID,
+				"file_name", fuName,
+				"key",       s3Key,
+				"elapsed",   time.Since(start).Round(time.Millisecond),
+			)
+		}()
 
 	} else {
-		// ── Локальный путь (для разработки без AWS) ───────────────────────────
+		// ── Synchronous local write ───────────────────────────────────────────
 		dir := filepath.Join(h.cfg.Directory, fmt.Sprint(uid))
 		if fu.FolderID != nil { dir = filepath.Join(dir, fmt.Sprint(*fu.FolderID)) }
 		outPath := filepath.Join(dir, filepath.FromSlash(fu.RelPath))
 		if fu.RelPath == "" { outPath = filepath.Join(dir, fu.FileName) }
 
 		if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
+			slog.Error("wsComplete: mkdir failed", "path", filepath.Dir(outPath), "err", err)
 			wsError(conn, "mkdir failed"); return
 		}
 		if err := os.WriteFile(outPath, fileBytes, 0o644); err != nil {
+			slog.Error("wsComplete: write failed", "path", outPath, "err", err)
 			wsError(conn, "write failed"); return
 		}
 
 		fu.Status   = "completed"
 		fu.FilePath = outPath
-		slog.Info("uploaded locally", "path", outPath, "file", fu.ID)
-	}
+		h.repo.Update(fu)
 
-	h.repo.Update(fu)
-	delete(chunks, req.FileUploadID)
-	conn.WriteJSON(map[string]any{"type": "done", "file": fu})
+		// ✅ LOG: upload finished
+		slog.Info("✓  upload complete (local)",
+			"file_id",   fu.ID,
+			"file_name", fu.FileName,
+			"path",      outPath,
+			"size",      len(fileBytes),
+		)
+
+		conn.WriteJSON(map[string]any{"type": "done", "file": fu})
+	}
 }
 
 func wsError(conn *websocket.Conn, msg string) {
+	slog.Warn("ws error sent to client", "message", msg)
 	conn.WriteJSON(map[string]any{"type": "error", "message": msg})
 }
 
 func sha256hex(b []byte) string {
-	s := sha256.Sum256(b); return hex.EncodeToString(s[:])
+	s := sha256.Sum256(b)
+	return hex.EncodeToString(s[:])
 }
 
 // ─── REST file handler ────────────────────────────────────────────────────────
@@ -241,7 +353,7 @@ func sha256hex(b []byte) string {
 type FileHandler struct {
 	repo types.IFileRepository
 	cfg  *config.UploadConfig
-	s3   *services.S3Service // nil = локальное хранилище
+	s3   *services.S3Service
 }
 
 func NewFileHandler(repo types.IFileRepository, cfg *config.UploadConfig, s3 *services.S3Service) *FileHandler {
@@ -287,22 +399,19 @@ func (h *FileHandler) GetTrashedFiles(c *fiber.Ctx) error {
 	return c.JSON(files)
 }
 
-// DownloadFile генерирует временную ссылку для скачивания файла.
-// Если S3 включён — возвращает presigned URL (браузер скачивает напрямую из S3).
-// Если локально — отдаёт файл через сервер.
 func (h *FileHandler) DownloadFile(c *fiber.Ctx) error {
 	file, err := h.fileOwner(c)
 	if err != nil { return err }
 
 	if h.s3 != nil && file.FilePath != "" {
-		// Генерируем временную ссылку на 15 минут
 		url, err := h.s3.PresignDownload(c.Context(), file.FilePath, 15*time.Minute)
-		if err != nil { return utils.Respond(c, utils.NewError(500, "failed to generate download link")) }
-		// Редиректим браузер напрямую на S3 — сервер не тратит трафик
+		if err != nil {
+			slog.Error("presign download failed", "file_id", file.ID, "err", err)
+			return utils.Respond(c, utils.NewError(500, "failed to generate download link"))
+		}
 		return c.Redirect(url, fiber.StatusTemporaryRedirect)
 	}
 
-	// Локальное скачивание
 	if file.FilePath == "" {
 		return utils.Respond(c, utils.NewError(404, "file not found on disk"))
 	}
@@ -342,25 +451,26 @@ func (h *FileHandler) RestoreFile(c *fiber.Ctx) error {
 	return c.JSON(file)
 }
 
-// DeleteFile удаляет файл из базы данных и из S3 (или с диска).
 func (h *FileHandler) DeleteFile(c *fiber.Ctx) error {
 	file, err := h.fileOwner(c)
 	if err != nil { return err }
 
-	// Удаляем из S3 если включён
 	if h.s3 != nil && file.FilePath != "" {
 		if err := h.s3.Delete(c.Context(), file.FilePath); err != nil {
-			slog.Warn("s3 delete failed", "key", file.FilePath, "err", err)
-			// Не останавливаем — удаляем запись из БД в любом случае
+			slog.Warn("s3 delete failed — continuing with DB delete",
+				"file_id", file.ID,
+				"key",     file.FilePath,
+				"err",     err,
+			)
 		}
 	} else if file.FilePath != "" {
-		// Удаляем локальный файл
 		os.Remove(file.FilePath)
 	}
 
 	if err := h.repo.Delete(file.ID, middleware.UserIDFromToken(c)); err != nil {
 		return utils.Respond(c, utils.NewError(500, "delete"))
 	}
+	slog.Info("file deleted", "file_id", file.ID, "file_name", file.FileName)
 	return c.SendStatus(fiber.StatusNoContent)
 }
 
