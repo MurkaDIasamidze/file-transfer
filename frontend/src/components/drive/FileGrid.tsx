@@ -6,35 +6,36 @@ import FileCard from './FileCard';
 export type SelectionKey = `file-${number}` | `folder-${number}`;
 
 interface Props {
-  folders:         Folder[];
-  files:           FileItem[];
-  viewMode:        'my-drive' | 'recent' | 'starred' | 'trash';
+  folders:          Folder[];
+  files:            FileItem[];
+  viewMode:         'my-drive' | 'recent' | 'starred' | 'trash';
   // selection
-  selected:        Set<SelectionKey>;
-  onSelect:        (key: SelectionKey) => void;
-  onClearSelection:() => void;
+  selected:         Set<SelectionKey>;
+  onSelect:         (key: SelectionKey) => void;
+  onClearSelection: () => void;
   // individual actions
-  onOpenFolder:    (f: Folder) => void;
-  onTrashFolder:   (id: number) => void;
-  onRestoreFolder: (id: number) => void;
-  onDeleteFolder:  (id: number) => void;
-  onMoveFile:      (fileId: number, folderId: number | null) => void;
-  onToggleStar:    (id: number) => void;
-  onTrashFile:     (id: number) => void;
-  onRestoreFile:   (id: number) => void;
-  onDeleteFile:    (id: number) => void;
+  onOpenFolder:     (f: Folder) => void;
+  onTrashFolder:    (id: number) => void;
+  onRestoreFolder:  (id: number) => void;
+  onDeleteFolder:   (id: number) => void;
+  onMoveFile:       (fileId: number, folderId: number | null) => void;
+  onDownloadFile:   (file: FileItem) => void;
+  onToggleStar:     (id: number) => void;
+  onTrashFile:      (id: number) => void;
+  onRestoreFile:    (id: number) => void;
+  onDeleteFile:     (id: number) => void;
   // bulk actions
-  onBulkTrash:     () => void;
-  onBulkRestore:   () => void;
-  onBulkDelete:    () => void;
-  onBulkStar:      () => void;
+  onBulkTrash:      () => void | Promise<void>;
+  onBulkRestore:    () => void | Promise<void>;
+  onBulkDelete:     () => void | Promise<void>;
+  onBulkStar:       () => void | Promise<void>;
 }
 
 export default function FileGrid({
   folders, files, viewMode,
   selected, onSelect, onClearSelection,
   onOpenFolder, onTrashFolder, onRestoreFolder, onDeleteFolder,
-  onMoveFile, onToggleStar, onTrashFile, onRestoreFile, onDeleteFile,
+  onMoveFile, onDownloadFile, onToggleStar, onTrashFile, onRestoreFile, onDeleteFile,
   onBulkTrash, onBulkRestore, onBulkDelete, onBulkStar,
 }: Props) {
   const totalItems  = folders.length + files.length;
@@ -246,6 +247,7 @@ export default function FileGrid({
                 selected={selected.has(`file-${f.id}`)}
                 selecting={selecting}
                 onSelect={(id) => onSelect(`file-${id}`)}
+                onDownload={() => onDownloadFile(f)}
                 onMove={folderId => onMoveFile(f.id, folderId)}
                 onToggleStar={() => onToggleStar(f.id)}
                 onTrash={() => onTrashFile(f.id)}

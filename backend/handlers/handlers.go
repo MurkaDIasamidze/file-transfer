@@ -399,22 +399,36 @@ func (h *FileHandler) GetTrashedFiles(c *fiber.Ctx) error {
 	return c.JSON(files)
 }
 
+// DownloadFile returns a short-lived download URL for the file.
+// For S3 files: returns a presigned URL the browser can fetch directly.
+// For local files: returns a /api/files/:id/stream URL the server will serve.
+// The frontend calls this via fetch (with Authorization header), then opens the URL.
 func (h *FileHandler) DownloadFile(c *fiber.Ctx) error {
 	file, err := h.fileOwner(c)
 	if err != nil { return err }
 
+	if file.Status == "processing" {
+		return utils.Respond(c, utils.NewError(fiber.StatusConflict, "file is still uploading to cloud storage, try again shortly"))
+	}
+
 	if h.s3 != nil && file.FilePath != "" {
-		url, err := h.s3.PresignDownload(c.Context(), file.FilePath, 15*time.Minute)
+		// Generate a 15-minute presigned S3 URL and return it as JSON.
+		// The browser fetches this URL directly from S3 — no server traffic.
+		url, err := h.s3.PresignDownload(c.Context(), file.FilePath, file.FileName, 15*time.Minute)
 		if err != nil {
 			slog.Error("presign download failed", "file_id", file.ID, "err", err)
 			return utils.Respond(c, utils.NewError(500, "failed to generate download link"))
 		}
-		return c.Redirect(url, fiber.StatusTemporaryRedirect)
+		slog.Info("download link issued (S3)", "file_id", file.ID, "file_name", file.FileName)
+		return c.JSON(fiber.Map{"url": url, "file_name": file.FileName})
 	}
 
+	// Local storage — stream the file directly
 	if file.FilePath == "" {
 		return utils.Respond(c, utils.NewError(404, "file not found on disk"))
 	}
+	slog.Info("download served (local)", "file_id", file.ID, "file_name", file.FileName)
+	c.Set("Content-Disposition", `attachment; filename="`+file.FileName+`"`)
 	return c.SendFile(file.FilePath)
 }
 

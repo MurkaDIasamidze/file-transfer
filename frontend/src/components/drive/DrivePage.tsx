@@ -118,6 +118,64 @@ export default function DrivePage() {
   const handleRestoreFile = async (id: number) => { await filesApi.restore(id);     refresh(); };
   const handleDeleteFile  = async (id: number) => { await filesApi.delete(id);      refresh(); };
 
+  // Download a file.
+  // 1. Ask our API for a download link (needs the JWT — can't put token in URL directly)
+  // 2a. S3: backend returns { url } — fetch that URL as a blob and trigger save
+  // 2b. Local: backend streams bytes directly — read as blob and trigger save
+  //
+  // Why fetch the S3 URL instead of window.open()?
+  // The `<a download>` attribute is ignored for cross-origin URLs (S3 domain ≠ our domain).
+  // Fetching it as a blob and creating an object URL makes it same-origin, so the
+  // filename and forced-download both work correctly.
+  const handleDownloadFile = useCallback(async (file: FileItem) => {
+    try {
+      const token   = localStorage.getItem('token');
+      const apiBase = (import.meta.env.VITE_API_URL ?? 'http://localhost:8081').replace(/\/$/, '');
+
+      // Step 1 — get the download link from our server
+      const res = await fetch(`${apiBase}/api/files/${file.id}/download`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+
+      if (!res.ok) {
+        console.error('[download] server error', res.status);
+        return;
+      }
+
+      let blob: Blob;
+      const contentType = res.headers.get('Content-Type') ?? '';
+
+      if (contentType.includes('application/json')) {
+        // S3 mode — backend returned { url: "https://s3.amazonaws.com/..." }
+        const { url } = await res.json() as { url: string };
+        // Fetch the actual file bytes from S3 (no auth needed — it's a presigned URL)
+        const s3Res = await fetch(url);
+        if (!s3Res.ok) {
+          console.error('[download] S3 fetch failed', s3Res.status);
+          return;
+        }
+        blob = await s3Res.blob();
+      } else {
+        // Local mode — backend streamed the bytes directly
+        blob = await res.blob();
+      }
+
+      // Step 2 — create a temporary object URL and click a hidden <a> tag
+      const blobUrl = URL.createObjectURL(blob);
+      const a       = document.createElement('a');
+      a.href        = blobUrl;
+      a.download    = file.file_name;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      // Release memory after the browser has had time to start the download
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 10_000);
+
+    } catch (err) {
+      console.error('[download] failed', err);
+    }
+  }, []);
+
   // ── Bulk actions ───────────────────────────────────────────────────────────
   const selectedFileIds   = [...selected].filter(k => k.startsWith('file-')).map(k => parseInt(k.slice(5)));
   const selectedFolderIds = [...selected].filter(k => k.startsWith('folder-')).map(k => parseInt(k.slice(7)));
@@ -274,6 +332,7 @@ export default function DrivePage() {
               onRestoreFolder={handleRestoreFolder}
               onDeleteFolder={handleDeleteFolder}
               onMoveFile={handleMoveFile}
+              onDownloadFile={handleDownloadFile}
               onToggleStar={handleToggleStar}
               onTrashFile={handleTrashFile}
               onRestoreFile={handleRestoreFile}

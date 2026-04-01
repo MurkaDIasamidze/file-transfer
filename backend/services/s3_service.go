@@ -74,14 +74,15 @@ func (s *S3Service) Delete(ctx context.Context, key string) error {
 
 // PresignDownload generates a temporary download URL for a file.
 // The URL is valid for `ttl` duration (e.g. 15 minutes).
-// Send this URL to the frontend — the browser downloads directly from S3,
-// bypassing your server entirely.
-func (s *S3Service) PresignDownload(ctx context.Context, key string, ttl time.Duration) (string, error) {
+// The Content-Disposition header is embedded in the presigned URL so the
+// browser saves the file with the original filename regardless of the S3 key.
+func (s *S3Service) PresignDownload(ctx context.Context, key string, fileName string, ttl time.Duration) (string, error) {
 	presigner := s3.NewPresignClient(s.client)
 
 	req, err := presigner.PresignGetObject(ctx, &s3.GetObjectInput{
-		Bucket: aws.String(s.bucket),
-		Key:    aws.String(key),
+		Bucket:                     aws.String(s.bucket),
+		Key:                        aws.String(key),
+		ResponseContentDisposition: aws.String(`attachment; filename="` + fileName + `"`),
 	}, s3.WithPresignExpires(ttl))
 	if err != nil {
 		return "", fmt.Errorf("failed to presign download for key %q: %w", key, err)

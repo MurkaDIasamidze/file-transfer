@@ -23,9 +23,7 @@ export default function FolderCard({
   const [dragOver, setDragOver] = useState(false);
 
   const handleClick = () => {
-    if (selecting) {
-      onSelect(folder.id);
-    }
+    if (selecting) onSelect(folder.id);
   };
 
   const handleCheckbox = (e: React.MouseEvent) => {
